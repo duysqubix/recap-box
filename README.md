@@ -1,10 +1,12 @@
 # recap-box
 
-A Claude Code mod: a small box beside the transcript that names the stage of the work and recaps the session in two or three sentences.
+A Claude Code mod: a small box beside the transcript that says, in plain words, what the session is doing now and what it is working toward.
 
-- The stage is one of researching, planning, coding, testing, debugging, reviewing, writing or shipping, each in its own theme color.
-- Once a minute the box checks the transcript. It asks Haiku for a new recap only when the transcript changed and the box is on screen.
-- A countdown under the recap shows the next check.
+- On top: the stage of the work and one or two sentences on what is happening now. The stage is one of researching, planning, coding, testing, debugging, reviewing, writing or shipping, each in its own theme color.
+- The stage comes from the tools the session runs, not from a guess. Reading and searching is researching. Edits are coding, or writing when they change docs. Test runs are testing, review agents are reviewing, and commits, pushes and CI runs are shipping. The stage is what most of the last ten calls did. A failed test run among the last ten shows debugging until a run passes.
+- Below, pinned: the goal of the whole session, drawn from what you asked for. Haiku keeps it until your requests move on. The box sees only what you ask after it loads, so in a resumed session the goal starts from the transcript.
+- The recap and the goal use everyday words, with no jargon, no abbreviations and no names of files or code.
+- Once a minute the box checks the transcript. When the transcript changed and the box is on screen, it reads the stage and asks Haiku for a new recap. A countdown at the bottom shows the next check.
 
 `/recap-box` opens the box again after you close it.
 

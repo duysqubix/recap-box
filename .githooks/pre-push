@@ -1,0 +1,8 @@
+#!/bin/sh
+# Every install that auto-updates runs what reaches main, so nothing reaches it unchecked.
+set -e
+cd "$(git rev-parse --show-toplevel)"
+claude plugin validate .
+claude plugin test .
+# tsc needs the types the engine lays in .claude-plugin/types once it has loaded this folder.
+if [ -d .claude-plugin/types ]; then tsc -p .; fi

@@ -1,0 +1,5 @@
+{
+  "name": "recap-box",
+  "description": "A small box beside the transcript naming the stage of the work, with a 2-3 sentence recap of the session, refreshed every minute while it changes",
+  "types": "./types/index.d.ts"
+}

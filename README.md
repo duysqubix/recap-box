@@ -30,7 +30,7 @@ In the desktop app, where `/plugin` does not run: click + next to the prompt box
 
 Every commit on `main` is a release. `plugin.json` has no `version`, so Claude Code versions the plugin by commit.
 
-Claude Code leaves auto-update off for marketplaces it does not ship. To turn it on, set `autoUpdate` on the marketplace's entry in `~/.claude/settings.json`. Claude Code reads this flag only from the user settings.
+Claude Code leaves auto-update off for marketplaces it does not ship. To turn it on, set `autoUpdate` on the marketplace's entry in `~/.claude/settings.json`. Claude Code ignores this flag in project and local settings.
 
 ```json
 "extraKnownMarketplaces": {
@@ -44,7 +44,9 @@ Claude Code leaves auto-update off for marketplaces it does not ship. To turn it
 That entry, with `"recap-box@recap-box": true` under `enabledPlugins`, has two effects:
 
 - Each session checks for new commits at a random moment in its first 10 minutes. A session that takes one shows `Plugin updated: recap-box`, then reloads it or says to run `/reload-plugins`.
-- The install heals itself. A marketplace or plugin record that goes missing from `~/.claude/plugins` comes back when the next session starts. Missing plugin files come back at that session's check.
+- The install heals itself. If the marketplace or the plugin record goes missing from `~/.claude/plugins`, it comes back within two session starts. Missing plugin files come back at the next check.
+
+Claude Code skips the check when its own auto-updater is off, as under `DISABLE_AUTOUPDATER` or `DISABLE_UPDATES`. Set `FORCE_AUTOUPDATE_PLUGINS=1` to keep the check on for plugins.
 
 To update right away:
 

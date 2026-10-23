@@ -7,9 +7,10 @@ A Claude Code mod: a small box beside the transcript that says, in plain words, 
 - When the last five calls only read, search or run other commands, the stage is what a helper agent at work does, or researching. While the session waits on a helper agent, the stage is the helper's. When the newest test run among the last five failed, by its exit code or by a failure its output reports, the stage is debugging. A run sent to the background does not count, since its result comes later.
 - Below, pinned: the goal of the whole session, drawn from what you asked for. Haiku keeps it until your requests move on. The box sees only what you ask after it loads, so in a resumed session the goal starts from the transcript.
 - The recap and the goal use everyday words, with no jargon, no abbreviations and no names of files or code.
-- Once a minute by default, while the box is on screen, it reads the stage from the latest tool calls. When the transcript changed, it also asks Haiku for a new recap. A countdown at the bottom shows the next check.
+- The box updates as the session works, with no timer. Each tool call, and each helper agent that starts or ends, has it read the stage again, two seconds after the last of a burst. It asks Haiku for a new recap when a turn of the session ends, and every fifth call of a long turn, at most once every ten seconds. A recap due sooner waits out the ten seconds, then reads what is newest. When the transcript has not changed, it asks nothing.
+- While the box is off screen it reads nothing. A recap that came due meanwhile is written once the box shows again.
 
-`/recap-box` opens the box again after you close it. `/recap-box update 30` makes it check every 30 seconds instead of 60, from 10 to 3600. Later sessions keep the setting; sessions already open keep theirs until they restart.
+`/recap-box` opens the box again after you close it.
 
 ## Install
 

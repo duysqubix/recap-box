@@ -1,14 +1,14 @@
 import { atom, read, update } from 'claude-code'
-import type { AgentInfo, EngineInterface, PromptOrigin, Register, SessionMessage, ThemeKey, ToolUseSummary } from 'claude-code'
+import type { AgentInfo, EngineInterface, PromptOrigin, Register, SessionMessage, ThemeKey, Timer, ToolUseSummary } from 'claude-code'
 import type { Stage } from '../types'
 
 const PANE = 'recap'
-const EVERY_S = 60
-// The seconds `/recap-box update` takes: at most one Haiku call each check, and a check at least hourly.
-const MIN_S = 10
-const MAX_S = 3600
-// Seconds between checks, read from the store at each start.
-let every = EVERY_S
+// A burst of events settles into one check this long after the last.
+const SETTLE_MS = 2_000
+// A long turn gets a recap every this many of its calls, not only at its end.
+const CALLS = 5
+// At most one Haiku call this often; one due sooner waits, so the last activity still gets one.
+const GAP_MS = 10_000
 const recap = atom({ plugin: 'recap-box', key: 'recap' } as const, null)
 // What the whole session works toward, pinned under the recap.
 const goal = atom({ plugin: 'recap-box', key: 'goal' } as const, null)
@@ -16,8 +16,6 @@ const goal = atom({ plugin: 'recap-box', key: 'goal' } as const, null)
 // ponytail: prompts sent before the mod loaded (a resumed session) are missing; the goal then reads the tail.
 const asks = atom({ plugin: 'recap-box', key: 'asks' } as const, [])
 const stage = atom({ plugin: 'recap-box', key: 'stage' } as const, null)
-// Seconds to the next check, counted down in the box.
-const left = atom({ plugin: 'recap-box', key: 'left' } as const, EVERY_S)
 
 // The stages a recap can name, each drawn in its theme color.
 const STAGES: Record<Stage, ThemeKey> = {
@@ -160,10 +158,34 @@ const whole = (text: string) => text.replace(/([\ud800-\udbff][\udc00-\udfff])|[
 let seen = ''
 let epoch = 0
 let isBusy = false
+// An event came while a check ran: one more check once it is done, so the last event is not lost.
+let isPending = false
+// A recap is asked for: at the end of the session's turn, or once a long turn made enough calls.
+let isDue = false
+// The session's own calls since the last recap.
+let calls = 0
+// When Haiku was last asked, by the session's clock.
+let asked = -Infinity
+let timer: Timer | undefined
 
-// While the box is drawn: read the stage, and re-summarize when the transcript's tail changed.
+// Each event puts the check off again, so a burst of them makes one. A timer outlives the
+// hook that set it, so no hook waits on Haiku.
+function soon($: EngineInterface, ms = SETTLE_MS) {
+  timer?.cancel()
+  timer = $.clock.after(ms, () => void refresh($))
+}
+
+const poke = ($: EngineInterface, isRecap: boolean) => {
+  if (isRecap) isDue = true
+  soon($)
+}
+
+// While the box is drawn: read the stage, and re-summarize when a recap is due and the transcript's tail changed.
 async function refresh($: EngineInterface) {
-  if (isBusy) return
+  if (isBusy) {
+    isPending = true
+    return
+  }
   isBusy = true
   const at = epoch
   try {
@@ -175,12 +197,26 @@ async function refresh($: EngineInterface) {
     // update: a write that races session.end's re-runs and keeps its null.
     const name = stageOf(recent, await $.agent.list())
     if (name) await update($, stage, old => (at === epoch ? name : old))
+    if (!isDue || at !== epoch) return
     // Compared by content: messages() holds only the newest 4096 rows, so a count stalls.
     const tail = transcript(recent)
-    if (!tail || tail === seen || at !== epoch) return
+    if (!tail || tail === seen) {
+      isDue = false
+      calls = 0
+      return
+    }
+    // Too soon after the last call: ask once the gap is over, with what is newest then.
+    const now = await $.clock.now()
+    if (now < asked + GAP_MS) {
+      soon($, asked + GAP_MS - now)
+      return
+    }
 
     // Seen even when the call fails, so a retry waits for new activity.
     seen = tail
+    isDue = false
+    calls = 0
+    asked = now
     const reply = await $.model.complete({
       model: 'haiku',
       system: SYSTEM,
@@ -197,8 +233,8 @@ async function refresh($: EngineInterface) {
     if (reply.isAnswered) {
       // Every line but the goal's is the recap.
       const aim = clean(reply.text.match(GOAL)?.[1] ?? '')
-      const now = clean(reply.text.replace(GOAL, '').replace(NOW, ''))
-      await update($, recap, old => (at === epoch ? now || old : old))
+      const text = clean(reply.text.replace(GOAL, '').replace(NOW, ''))
+      await update($, recap, old => (at === epoch ? text || old : old))
       if (aim && !SAME.test(aim)) await update($, goal, old => (at === epoch ? aim : old))
     }
   } catch (err) {
@@ -206,50 +242,63 @@ async function refresh($: EngineInterface) {
     await update($, recap, old => (at === epoch ? clean(`No recap: ${String(err)}`) : old))
   } finally {
     isBusy = false
+    if (isPending) {
+      isPending = false
+      void refresh($)
+    }
   }
-}
-
-// Each second: count the box down, and at zero check for new activity.
-async function tick($: EngineInterface) {
-  if ((await update($, left, n => (n > 1 ? n - 1 : every))) === every) await refresh($)
 }
 
 export const register: Register = on => {
   // Opened on every start: the desktop app, VS Code and mobile attach after a start without a surface.
   on('session.start', async ($, e, next) => {
-    await $.command.register({
-      name: 'recap-box',
-      description: 'Open the session recap box, or set the seconds between its checks',
-      argumentHint: '[update <seconds>]',
-    })
-    // The store is a file anyone can edit: a value out of range, or one that cannot be read, is the default.
-    const kept = Number(await $.store.get('every').catch(() => undefined))
-    every = Number.isInteger(kept) && kept >= MIN_S && kept <= MAX_S ? kept : EVERY_S
-    await update($, left, () => every)
+    await $.command.register({ name: 'recap-box', description: 'Open the session recap box' })
     void $.ui.open({ id: PANE, title: 'Recap', columns: 40 })
-    $.clock.every(1000, () => void tick($))
+    // A resumed session has a transcript already: recap it once the box is drawn.
+    poke($, true)
 
     return next(e)
   })
 
-  on('command.run', { command: 'recap-box' }, async ($, e) => {
-    if (e.args.trim()) {
-      const s = Number(/^update\s+(\d+)s?$/i.exec(e.args.trim())?.[1])
-      if (!(s >= MIN_S && s <= MAX_S)) {
-        return {
-          text: `/recap-box opens the box; /recap-box update <seconds>, from ${MIN_S} to ${MAX_S}, sets the time between checks. The box checks every ${every}s.`,
-        }
-      }
-      // Kept for later sessions, so saved first: a failed save changes nothing. The count starts over at the new length.
-      await $.store.set('every', s)
-      every = s
-      await update($, left, () => s)
+  // A surface that attaches draws the box: it shows what is due.
+  on('session.attach', async ($, e, next) => {
+    const r = await next(e)
+    poke($, false)
 
-      return { text: `The box checks every ${s}s.` }
-    }
+    return r
+  })
+
+  on('command.run', { command: 'recap-box' }, async ($, e) => {
+    if (e.args.trim()) return { text: '/recap-box opens the box. It updates as the session works.' }
     await $.ui.open({ id: PANE, title: 'Recap', columns: 40 })
+    poke($, false)
 
     return { text: 'Recap box opened.' }
+  })
+
+  // Every call can change the stage; a long turn's calls also ask for a recap now and then.
+  on('tool.call', async ($, e, next) => {
+    const r = await next(e)
+    if (e.agentId === undefined) calls += 1
+    poke($, calls >= CALLS)
+
+    return r
+  })
+
+  // A helper starting changes the stage, as the session's own start does not.
+  on('turn.start', async ($, e, next) => {
+    const r = await next(e)
+    if (e.agentId !== undefined) poke($, false)
+
+    return r
+  })
+
+  // The session's turn ending asks for a recap; a helper's ending only changes the stage.
+  on('turn.complete', async ($, e, next) => {
+    const r = await next(e)
+    poke($, e.agentId === undefined)
+
+    return r
   })
 
   // Read here, where the engine says who sent a prompt: the transcript mixes in notices
@@ -271,6 +320,10 @@ export const register: Register = on => {
   on('session.end', async ($, e, next) => {
     seen = ''
     epoch += 1
+    // Nothing of the old conversation is due.
+    timer?.cancel()
+    isDue = false
+    calls = 0
     // First, so a prompt that follows the /clear at once is not wiped with the old asks.
     await update($, asks, () => [])
     await update($, recap, () => null)
@@ -292,7 +345,6 @@ export const register: Register = on => {
     const text = await read($, recap)
     const aim = await read($, goal)
     const name = await read($, stage)
-    const n = await read($, left)
 
     return (
       <Box flexDirection="column" gap={1}>
@@ -306,7 +358,6 @@ export const register: Register = on => {
             <Text>{aim}</Text>
           </Box>
         )}
-        <Text dimColor>{`next check in ${n}s`}</Text>
       </Box>
     )
   })

@@ -9,6 +9,10 @@ const SETTLE_MS = 2_000
 const CALLS = 5
 // At most one Haiku call this often; one due sooner waits, so the last activity still gets one.
 const GAP_MS = 10_000
+// A steady stream of events puts the check off this many times at most, so it still runs.
+const DELAYS = 5
+// A check that still reads the transcript a /resume left tries again this many times.
+const TRIES = 5
 const recap = atom({ plugin: 'recap-box', key: 'recap' } as const, null)
 // What the whole session works toward, pinned under the recap.
 const goal = atom({ plugin: 'recap-box', key: 'goal' } as const, null)
@@ -169,12 +173,24 @@ let calls = 0
 // When Haiku was last asked, by the session's clock.
 let asked = -Infinity
 let timer: Timer | undefined
+// How often the pending check was put off.
+let delays = 0
+// The tail a /resume left, and how often a check has read it since: until the engine swaps in
+// the transcript the resume brings, messages() still reads the old one.
+let outgoing = ''
+let tries = 0
 
-// Each event puts the check off again, so a burst of them makes one. A timer outlives the
-// hook that set it, so no hook waits on Haiku.
+// Each event puts the check off again, so a burst of them makes one, but only so often: a call
+// every second still gets its checks. A timer outlives the hook that set it, so no hook waits on Haiku.
 function soon($: EngineInterface, ms = SETTLE_MS) {
+  if (timer && delays >= DELAYS) return
+  if (timer) delays += 1
   timer?.cancel()
-  timer = $.clock.after(ms, () => void refresh($))
+  timer = $.clock.after(ms, () => {
+    timer = undefined
+    delays = 0
+    void refresh($)
+  })
 }
 
 const poke = ($: EngineInterface, isRecap: boolean) => {
@@ -190,23 +206,31 @@ async function refresh($: EngineInterface) {
   }
   isBusy = true
   const at = epoch
-  // Taken before the transcript is read: a recap asked for after that stays due.
+  // Taken before the transcript is read: a recap asked for after that stays due, and calls made after count on.
   const want = wanted
+  const made = calls
   try {
     const panes = await $.ui.panes()
     if (!panes.some(p => p.id === PANE && p.isPlaced)) return
     const recent = (await $.session.messages()).slice(-60)
+    // Compared by content: messages() holds only the newest 4096 rows, so a count stalls.
+    const tail = transcript(recent)
+    if (outgoing && tail === outgoing && at === epoch && tries < TRIES) {
+      // Still the conversation a /resume left: neither its stage nor its recap is the new one's.
+      tries += 1
+      soon($)
+      return
+    }
+    outgoing = ''
     // Read at every check: a call's result can land, or a helper start or end, while the transcript reads the same.
     // A /clear while this check ran makes it the old conversation's. Checked inside
     // update: a write that races session.end's re-runs and keeps its null.
     const name = stageOf(recent, await $.agent.list())
     if (name) await update($, stage, old => (at === epoch ? name : old))
     if (want === met || at !== epoch) return
-    // Compared by content: messages() holds only the newest 4096 rows, so a count stalls.
-    const tail = transcript(recent)
     if (!tail || tail === seen) {
       met = want
-      calls = 0
+      calls = Math.max(0, calls - made)
       return
     }
     // Read before the clock, so the gap runs from the call itself.
@@ -219,16 +243,17 @@ async function refresh($: EngineInterface) {
     const now = await $.clock.now()
     // A /clear while this check waited: what is due now is the new conversation's.
     if (at !== epoch) return
-    // Too soon after the last call: ask once the gap is over, with what is newest then.
+    // Too soon after the last call: ask once the gap is over, with what is newest then. A check
+    // already pending comes sooner, and sets the wait again.
     if (now < asked + GAP_MS) {
-      soon($, asked + GAP_MS - now)
+      if (!timer) soon($, asked + GAP_MS - now)
       return
     }
 
     // Seen even when the call fails, so a retry waits for new activity.
     seen = tail
     met = want
-    calls = 0
+    calls = Math.max(0, calls - made)
     asked = now
     const reply = await $.model.complete({
       model: 'haiku',
@@ -287,8 +312,9 @@ export const register: Register = on => {
   // Every call can change the stage; a long turn's calls also ask for a recap now and then.
   on('tool.call', async ($, e, next) => {
     const r = await next(e)
-    if (e.agentId === undefined) calls += 1
-    poke($, calls >= CALLS)
+    const isMain = e.agentId === undefined
+    if (isMain) calls += 1
+    poke($, isMain && calls >= CALLS)
 
     return r
   })
@@ -297,6 +323,14 @@ export const register: Register = on => {
   on('turn.start', async ($, e, next) => {
     const r = await next(e)
     if (e.agentId !== undefined) poke($, false)
+
+    return r
+  })
+
+  // The engine's own SessionStart, raised once a /resume has swapped in the transcript it brings.
+  on('classic.SessionStart', async ($, e, next) => {
+    const r = await next(e)
+    if (e.source === 'resume') poke($, true)
 
     return r
   })
@@ -330,13 +364,18 @@ export const register: Register = on => {
     epoch += 1
     // Nothing of the old conversation is due.
     timer?.cancel()
+    timer = undefined
+    delays = 0
     met = wanted
     calls = 0
+    tries = 0
     // First, so a prompt that follows the /clear at once is not wiped with the old asks.
     await update($, asks, () => [])
     await update($, recap, () => null)
     await update($, goal, () => null)
     await update($, stage, () => null)
+    // Read before the end: after it, a check may still read this tail for a while.
+    outgoing = e.reason === 'resume' ? transcript((await $.session.messages()).slice(-60)) : ''
     // Again once the end is done: a check that started meanwhile read the old conversation.
     const r = await next(e)
     seen = ''
@@ -344,8 +383,8 @@ export const register: Register = on => {
     await update($, recap, () => null)
     await update($, goal, () => null)
     await update($, stage, () => null)
-    // A /resume brings a transcript of its own: recap it. After a /clear there is none to recap.
-    poke($, true)
+    // A /resume brings a transcript of its own: recap it. A /clear brings none, and an exit or logout ends here.
+    if (e.reason === 'resume') poke($, true)
 
     return r
   })
@@ -355,6 +394,10 @@ export const register: Register = on => {
     const text = await read($, recap)
     const aim = await read($, goal)
     const name = await read($, stage)
+    // Drawn at last (the person opened it, or widened the terminal): a recap that came due while it
+    // waited undrawn is checked now. Only with nothing pending, so the check's own writes, which
+    // draw the box again, schedule nothing.
+    if (wanted > met && !timer && !isBusy) soon($)
 
     return (
       <Box flexDirection="column" gap={1}>

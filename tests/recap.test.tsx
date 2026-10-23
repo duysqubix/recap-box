@@ -249,6 +249,79 @@ test('an event while a check runs gets one more check once that one is done', as
   await ui.unmount()
 })
 
+test('a turn that ends while a check reads an older transcript still gets its recap', async ($, on) => {
+  const clock = mock.clock(on)
+  const messages: SessionMessage[] = [{ role: 'user', text: 'one', toolUses: [] }]
+  const read = async () => {
+    const rows = [...messages]
+    await clock.sleep(3_000)
+
+    return rows
+  }
+  const prompts: string[] = []
+  engine(on, read, e => {
+    prompts.push(e.prompt)
+
+    return say('Now: Working.')
+  })
+
+  // The start's check reads from two seconds in to five; the turn ends meanwhile.
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await clock.advance(2_500)
+  messages.push({ role: 'assistant', text: 'the final answer', toolUses: [] })
+  await $.turn.complete(END)
+  await clock.advance(30_000)
+
+  // The first recap read the older transcript; the turn's own came after it, past the gap.
+  expect(prompts.length).toBe(2)
+  expect(prompts[0]).not.toContain('the final answer')
+  expect(prompts[1]).toContain('assistant: the final answer')
+})
+
+test('a /resume recaps the transcript it brings, with no new activity', async ($, on) => {
+  const clock = mock.clock(on)
+  const messages: SessionMessage[] = [{ role: 'user', text: 'old work', toolUses: [] }]
+  const prompts: string[] = []
+  engine(on, messages, e => {
+    prompts.push(e.prompt)
+
+    return say('Now: Working.')
+  })
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await clock.advance(2_000)
+  expect(prompts.length).toBe(1)
+  messages.splice(0, messages.length, { role: 'user', text: 'the resumed work', toolUses: [] })
+  await $.session.end({ ...CLEAR, reason: 'resume' })
+  await clock.advance(10_000)
+
+  expect(prompts.length).toBe(2)
+  expect(prompts[1]).toContain('user: the resumed work')
+})
+
+test("a /clear drops the old conversation's pending check: nothing reads it while the end runs", async ($, on) => {
+  const clock = mock.clock(on)
+  let reads = 0
+  const read = async () => {
+    reads += 1
+
+    return [did(EDIT)]
+  }
+  const end = () => clock.sleep(5_000)
+  engine(on, read, () => say('Now: Working.'), { end })
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await clock.advance(2_000)
+  const before = reads
+  // A call puts a check two seconds off; the /clear starts before then and takes five.
+  await $.tool.call({ tool: 'Read', file_path: '/r/README.md' })
+  const ending = $.session.end(CLEAR)
+  await clock.advance(4_000)
+  expect(reads).toBe(before)
+  await clock.advance(1_000)
+  await ending
+})
+
 test('/recap-box opens the box and checks it; with words it says what it does', async ($, on) => {
   const clock = mock.clock(on)
   const messages: SessionMessage[] = [{ role: 'user', text: 'one', toolUses: [] }]

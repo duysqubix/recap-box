@@ -160,8 +160,10 @@ let epoch = 0
 let isBusy = false
 // An event came while a check ran: one more check once it is done, so the last event is not lost.
 let isPending = false
-// A recap is asked for: at the end of the session's turn, or once a long turn made enough calls.
-let isDue = false
+// Recaps asked for (at the end of the session's turn, or once a long turn made enough calls) and
+// answered: counted, so a check answers only what was asked before it read the transcript.
+let wanted = 0
+let met = 0
 // The session's own calls since the last recap.
 let calls = 0
 // When Haiku was last asked, by the session's clock.
@@ -176,7 +178,7 @@ function soon($: EngineInterface, ms = SETTLE_MS) {
 }
 
 const poke = ($: EngineInterface, isRecap: boolean) => {
-  if (isRecap) isDue = true
+  if (isRecap) wanted += 1
   soon($)
 }
 
@@ -188,6 +190,8 @@ async function refresh($: EngineInterface) {
   }
   isBusy = true
   const at = epoch
+  // Taken before the transcript is read: a recap asked for after that stays due.
+  const want = wanted
   try {
     const panes = await $.ui.panes()
     if (!panes.some(p => p.id === PANE && p.isPlaced)) return
@@ -197,16 +201,25 @@ async function refresh($: EngineInterface) {
     // update: a write that races session.end's re-runs and keeps its null.
     const name = stageOf(recent, await $.agent.list())
     if (name) await update($, stage, old => (at === epoch ? name : old))
-    if (!isDue || at !== epoch) return
+    if (want === met || at !== epoch) return
     // Compared by content: messages() holds only the newest 4096 rows, so a count stalls.
     const tail = transcript(recent)
     if (!tail || tail === seen) {
-      isDue = false
+      met = want
       calls = 0
       return
     }
-    // Too soon after the last call: ask once the gap is over, with what is newest then.
+    // Read before the clock, so the gap runs from the call itself.
+    const prompt = whole(
+      `Goal so far: ${(await read($, goal)) ?? 'none'}\n` +
+        `Previous recap: ${(await read($, recap)) ?? 'none'}\n\n` +
+        `What the person asked for, oldest first:\n${(await read($, asks)).map(t => `- ${t}`).join('\n') || 'none'}\n\n` +
+        `Transcript tail, oldest first:\n${tail}`,
+    )
     const now = await $.clock.now()
+    // A /clear while this check waited: what is due now is the new conversation's.
+    if (at !== epoch) return
+    // Too soon after the last call: ask once the gap is over, with what is newest then.
     if (now < asked + GAP_MS) {
       soon($, asked + GAP_MS - now)
       return
@@ -214,18 +227,13 @@ async function refresh($: EngineInterface) {
 
     // Seen even when the call fails, so a retry waits for new activity.
     seen = tail
-    isDue = false
+    met = want
     calls = 0
     asked = now
     const reply = await $.model.complete({
       model: 'haiku',
       system: SYSTEM,
-      prompt: whole(
-        `Goal so far: ${(await read($, goal)) ?? 'none'}\n` +
-          `Previous recap: ${(await read($, recap)) ?? 'none'}\n\n` +
-          `What the person asked for, oldest first:\n${(await read($, asks)).map(t => `- ${t}`).join('\n') || 'none'}\n\n` +
-          `Transcript tail, oldest first:\n${tail}`,
-      ),
+      prompt,
       maxTokens: 200,
       effort: 'low',
       timeoutMs: 30_000,
@@ -322,7 +330,7 @@ export const register: Register = on => {
     epoch += 1
     // Nothing of the old conversation is due.
     timer?.cancel()
-    isDue = false
+    met = wanted
     calls = 0
     // First, so a prompt that follows the /clear at once is not wiped with the old asks.
     await update($, asks, () => [])
@@ -336,6 +344,8 @@ export const register: Register = on => {
     await update($, recap, () => null)
     await update($, goal, () => null)
     await update($, stage, () => null)
+    // A /resume brings a transcript of its own: recap it. After a /clear there is none to recap.
+    poke($, true)
 
     return r
   })

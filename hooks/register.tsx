@@ -62,7 +62,9 @@ const LEAD = /^([A-Za-z_]\w*=\S*|time|env|sudo|nohup|exec|if|then|else|while|unt
 const SHIP =
   /^(git( -[Cc] \S+)* (push|commit|tag)|gh (pr (create|merge|ready)|release create|run (watch|rerun))|ci-watch|deploy|(npm|pnpm|yarn|bun|cargo|uv|poetry) publish)\b/
 const TEST =
-  /^((pytest|jest|vitest|tsc|ruff|mypy|eslint)|(npm|npx|pnpm|yarn|bun|bunx|uv|cargo|go|make|deno|poetry|python3?|claude)( -\S+| run| exec| x| plugin)* (test|check|validate|lint|clippy|typecheck|pytest|jest|vitest|tsc|ruff|mypy|eslint))\b/
+  /^((pytest|jest|vitest|tsc|ruff|mypy|eslint)|(npm|npx|pnpm|yarn|bun|bunx|uv|cargo|go|make|deno|poetry|python3?|claude)( -\S+| run| exec| x| plugin)* (test|check|validate|lint|clippy|typecheck|pytest|unittest|jest|vitest|tsc|ruff|mypy|eslint))\b/
+// A run piped to tail exits 0 however it went: its output says.
+const FAILED = /test result: FAILED|\b[1-9]\d* (fail|failed|failing)\b|^error(\[E\d+\])?:|\berror TS\d+:|Validation failed/m
 
 function shellStage(command: string): Stage {
   const commands = command
@@ -98,10 +100,13 @@ function stageOf(messages: readonly SessionMessage[], agents: readonly AgentInfo
     })
     .slice(-5)
   // A run sent to the background answers when it starts, not how it ends.
-  if (votes.filter(v => v.s === 'testing' && !v.t.input.run_in_background).pop()?.t.isError) return 'debugging'
-  // The session's own helpers: not a plugin's, nor one inside another agent.
+  const run = votes.filter(v => v.s === 'testing' && !v.t.input.run_in_background).pop()?.t
+  if (run && (run.isError || FAILED.test(run.text ?? ''))) return 'debugging'
+  // The session's own helpers at work, or waiting on their own runs: not a plugin's, nor one inside
+  // another agent, nor a teammate in a pane of its own, whose status outlives a closed pane.
+  // ponytail: with two at work, the one listed last shows; pick by start time if that misleads.
   const helper = agents
-    .filter(a => a.status === 'running' && !a.parentId && !a.spawnedBy)
+    .filter(a => ['running', 'waiting'].includes(a.status) && !a.parentId && !a.spawnedBy && a.id !== a.teammateId)
     .map(a => named(`Agent ${a.type}`, a.description))
     .filter(s => s !== undefined)
     .pop()
@@ -143,10 +148,10 @@ const transcript = (messages: readonly SessionMessage[]) =>
 // One line of plain text: a Text refuses control characters.
 const clean = (text: string) => text.replace(/[\x00-\x1f\x7f-\x9f\s]+/g, ' ').trim()
 
-// The reply's labeled lines, in either order; a short goal that says it still fits keeps the pinned one.
+// The reply's labeled lines, in either order; a goal that only says it still fits keeps the pinned one.
 const GOAL = /^\W*goal\W*:[\s*]*(.*)$/im
 const NOW = /^\W*now\W*:[\s*]*/im
-const isSame = (aim: string) => aim.split(' ').length <= 4 && /\b(same|unchanged|no changes?|none)\b/i.test(aim)
+const SAME = /^\W*(still )?(the )?(same|unchanged|no changes?|none)( one| goal| as before)?\W*$/i
 
 // A cut can split an emoji's pair, and the API refuses a lone half: keep whole pairs, drop halves.
 const whole = (text: string) => text.replace(/([\ud800-\udbff][\udc00-\udfff])|[\ud800-\udfff]/g, '$1')
@@ -193,7 +198,7 @@ async function refresh($: EngineInterface) {
       const aim = clean(reply.text.match(GOAL)?.[1] ?? '')
       const now = clean(reply.text.replace(GOAL, '').replace(NOW, ''))
       await update($, recap, old => (at === epoch ? now || old : old))
-      if (aim && !isSame(aim)) await update($, goal, old => (at === epoch ? aim : old))
+      if (aim && !SAME.test(aim)) await update($, goal, old => (at === epoch ? aim : old))
     }
   } catch (err) {
     // Only a request the engine refuses to send rejects (a blocked model): say so in the box.
@@ -216,7 +221,9 @@ export const register: Register = on => {
       description: 'Open the session recap box, or set the seconds between its checks',
       argumentHint: '[update <seconds>]',
     })
-    every = Number(await $.store.get('every')) || EVERY_S
+    // The store is a file anyone can edit: a value out of range, or one that cannot be read, is the default.
+    const kept = Number(await $.store.get('every').catch(() => undefined))
+    every = Number.isInteger(kept) && kept >= MIN_S && kept <= MAX_S ? kept : EVERY_S
     await update($, left, () => every)
     void $.ui.open({ id: PANE, title: 'Recap', columns: 40 })
     $.clock.every(1000, () => void tick($))
@@ -228,11 +235,13 @@ export const register: Register = on => {
     if (e.args.trim()) {
       const s = Number(/^update\s+(\d+)s?$/i.exec(e.args.trim())?.[1])
       if (!(s >= MIN_S && s <= MAX_S)) {
-        return { text: `Usage: /recap-box update <seconds>, from ${MIN_S} to ${MAX_S}. The box checks every ${every}s.` }
+        return {
+          text: `/recap-box opens the box; /recap-box update <seconds>, from ${MIN_S} to ${MAX_S}, sets the time between checks. The box checks every ${every}s.`,
+        }
       }
-      // Kept for later sessions; the count starts over at the new length.
-      every = s
+      // Kept for later sessions, so saved first: a failed save changes nothing. The count starts over at the new length.
       await $.store.set('every', s)
+      every = s
       await update($, left, () => s)
 
       return { text: `The box checks every ${s}s.` }
@@ -244,12 +253,13 @@ export const register: Register = on => {
 
   // Read here, where the engine says who sent a prompt: the transcript mixes in notices
   // and other sessions' messages, and carries a prompt typed mid-turn inside a reminder.
-  // A command with a word or none after it asks for nothing (/clear, /effort max).
+  // A command with a word or none after it asks for nothing (/clear, /effort max), nor does the box's own.
   on('prompt.submit', async ($, e, next) => {
     // What entered, as the hooks beneath left it: a dropped prompt has no text, a masked one its mask.
     const r = await next(e)
     const text = clean(r.text ?? '').slice(0, 1200)
-    if (text && !e.isMeta && isPerson(e.origin) && (!e.command || /\s/.test(e.command.args.trim()))) {
+    const isAsk = !e.command || (e.command.name !== 'recap-box' && /\s/.test(e.command.args.trim()))
+    if (text && !e.isMeta && isPerson(e.origin) && isAsk) {
       await update($, asks, list => (list.length < 9 ? [...list, text] : [...list.slice(0, 1), ...list.slice(2), text]))
     }
 
@@ -265,8 +275,15 @@ export const register: Register = on => {
     await update($, recap, () => null)
     await update($, goal, () => null)
     await update($, stage, () => null)
+    // Again once the end is done: a check that started meanwhile read the old conversation.
+    const r = await next(e)
+    seen = ''
+    epoch += 1
+    await update($, recap, () => null)
+    await update($, goal, () => null)
+    await update($, stage, () => null)
 
-    return next(e)
+    return r
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {

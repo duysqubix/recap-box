@@ -1,5 +1,5 @@
 {
   "name": "recap-box",
-  "description": "A small box beside the transcript: the stage of the work, what is happening now, and the session's goal pinned below, in plain words, refreshed every minute while the session changes",
+  "description": "A small box beside the transcript: the stage of the work, what is happening now, and the session's goal pinned below, in plain words, refreshed once a minute, or as often as /recap-box update sets",
   "types": "./types/index.d.ts"
 }

@@ -101,7 +101,8 @@ function stageOf(messages: readonly SessionMessage[], agents: readonly AgentInfo
     .slice(-5)
   // A run sent to the background answers when it starts, not how it ends.
   const run = votes.filter(v => v.s === 'testing' && !v.t.input.run_in_background).pop()?.t
-  if (run && (run.isError || FAILED.test(run.text ?? ''))) return 'debugging'
+  // An agent's answer is its report: "fixed the 2 failing tests" is no failed run.
+  if (run && (run.isError || (run.tool === 'Bash' && FAILED.test(run.text ?? '')))) return 'debugging'
   // The session's own helpers at work, or waiting on their own runs: not a plugin's, nor one inside
   // another agent, nor a teammate in a pane of its own, whose status outlives a closed pane.
   // ponytail: with two at work, the one listed last shows; pick by start time if that misleads.
@@ -151,7 +152,7 @@ const clean = (text: string) => text.replace(/[\x00-\x1f\x7f-\x9f\s]+/g, ' ').tr
 // The reply's labeled lines, in either order; a goal that only says it still fits keeps the pinned one.
 const GOAL = /^\W*goal\W*:[\s*]*(.*)$/im
 const NOW = /^\W*now\W*:[\s*]*/im
-const SAME = /^\W*(still )?(the )?(same|unchanged|no changes?|none)( one| goal| as before)?\W*$/i
+const SAME = /^\W*(still )?(the )?(same|unchanged|no changes?|none)( one| goal)?( as before| so far| yet| from before)?\W*$/i
 
 // A cut can split an emoji's pair, and the API refuses a lone half: keep whole pairs, drop halves.
 const whole = (text: string) => text.replace(/([\ud800-\udbff][\udc00-\udfff])|[\ud800-\udfff]/g, '$1')

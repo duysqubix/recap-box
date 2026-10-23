@@ -526,6 +526,9 @@ test('a failed test run reads as debugging while it is among the last five calls
   for (const failure of ['test result: FAILED. 3 passed; 1 failed', ' 2 failing', 'error[E0425]: cannot find value', 'src/a.ts(1,2): error TS2345: no', 'Validation failed']) {
     expect({ failure, shown: await after(piped(failure)) }).toEqual({ failure, shown: 'DEBUGGING' })
   }
+  // A test agent's answer is its report, not a run's output.
+  const tester = use('Agent', { subagent_type: 'oh-my-claudecode:test-engineer', description: 'Fix the tests', prompt: 'p' })
+  expect(await after({ ...tester, text: 'Fixed the 2 failing tests.' })).toBe('TESTING')
   await ui.unmount()
 })
 
@@ -618,6 +621,9 @@ test('the goal holds until a reply names a new one', async ($, on) => {
     'Now: Nearly done.\nGoal: Unchanged.',
     'Now: Tidying up.\nGoal: No changes.',
     'Now: Wrapping up.\nGoal: Still the same one.',
+    'Now: Looking it over.\nGoal: none yet',
+    'Now: Reading it again.\nGoal: Same goal as before.',
+    'Now: Last touches.\nGoal: Unchanged from before.',
     // A goal that names "same" among other words is a new goal.
     'Now: Sharing it.\nGoal: Keep the same box.',
   ]
@@ -634,7 +640,7 @@ test('the goal holds until a reply names a new one', async ($, on) => {
 
   await clock.advance(60_000)
   expect(await shown()).toEqual(['Working out the plan.', 'GOAL', 'Build a recap box.'])
-  const nows = ['Writing the box.', 'Checking that the box works.', 'Checking it again.', 'Fixing a slip.', 'Nearly done.', 'Tidying up.', 'Wrapping up.']
+  const nows = ['Writing the box.', 'Checking that the box works.', 'Checking it again.', 'Fixing a slip.', 'Nearly done.', 'Tidying up.', 'Wrapping up.', 'Looking it over.', 'Reading it again.', 'Last touches.']
   for (const now of nows) {
     messages.push({ role: 'assistant', text: String(messages.length), toolUses: [] })
     await clock.advance(60_000)
@@ -646,7 +652,7 @@ test('the goal holds until a reply names a new one', async ($, on) => {
   await ui.unmount()
 
   // Each check is shown the goal it may keep.
-  expect(prompts.map(p => p.split('\n')[0])).toEqual(['Goal so far: none', ...Array(8).fill('Goal so far: Build a recap box.')])
+  expect(prompts.map(p => p.split('\n')[0])).toEqual(['Goal so far: none', ...Array(11).fill('Goal so far: Build a recap box.')])
 })
 
 test("the goal reads the person's own prompts, the first and the newest eight", async ($, on) => {

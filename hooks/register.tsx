@@ -294,19 +294,24 @@ export const register: Register = on => {
     const name = await read($, stage)
     const n = await read($, left)
 
+    // Every color a theme key, so the box follows the person's theme: the goal's label in Claude's own.
     return (
-      <Box flexDirection="column" gap={1}>
+      <Box flexDirection="column" gap={1} borderStyle="round" borderColor="promptBorder" paddingX={1}>
         <Box flexDirection="column">
           {name && <Text bold color={STAGES[name]}>{name.toUpperCase()}</Text>}
-          {text === null ? !name && !aim && <Text dimColor>Waiting for activity.</Text> : <Text>{text}</Text>}
+          {text === null ? (
+            !name && !aim && <Text color="inactive">Waiting for activity.</Text>
+          ) : (
+            <Text color="text">{text}</Text>
+          )}
         </Box>
         {aim && (
           <Box flexDirection="column">
-            <Text bold>GOAL</Text>
-            <Text>{aim}</Text>
+            <Text bold color="claude">GOAL</Text>
+            <Text color="text">{aim}</Text>
           </Box>
         )}
-        <Text dimColor>{`next check in ${n}s`}</Text>
+        <Text color="subtle">{`next check in ${n}s`}</Text>
       </Box>
     )
   })

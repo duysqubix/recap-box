@@ -120,7 +120,9 @@ test('the open box counts down to the next check, on every surface', async ($, o
   // Mounted first, so each count is a redraw of the open box.
   for (const [surface, shown] of [['terminal', 'next check in 45s'], ['desktop', 'next check in 30s']] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect((await ui.find({ type: 'Text', text: /Waiting/ }))?.text).toBe('Waiting for activity.')
+    const waiting = await ui.find({ type: 'Text', text: /Waiting/ })
+    expect(waiting?.text).toBe('Waiting for activity.')
+    expect(waiting?.props.color).toBe('inactive')
     await clock.advance(15_000)
     expect((await ui.find({ type: 'Text', text: /next check/ }))?.text).toBe(shown)
     await ui.unmount()
@@ -603,6 +605,17 @@ test('the goal sits pinned under what is happening now, on every surface', async
       'next check in 60s',
     ])
     expect((await ui.find({ type: 'Text', text: 'GOAL' }))?.props.bold).toBe(true)
+    // Every color a theme key, so the box follows the person's theme.
+    expect((await ui.findAll({ type: 'Text' })).map(t => t.props.color)).toEqual([
+      'claude',
+      'text',
+      'claude',
+      'text',
+      'subtle',
+    ])
+    const frame = await ui.find({ type: 'Box' })
+    expect(frame?.props.borderStyle).toBe('round')
+    expect(frame?.props.borderColor).toBe('promptBorder')
     await ui.unmount()
   }
 })

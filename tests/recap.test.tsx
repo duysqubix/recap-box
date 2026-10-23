@@ -613,9 +613,6 @@ test('the goal sits pinned under what is happening now, on every surface', async
       'text',
       'subtle',
     ])
-    const frame = await ui.find({ type: 'Box' })
-    expect(frame?.props.borderStyle).toBe('round')
-    expect(frame?.props.borderColor).toBe('promptBorder')
     await ui.unmount()
   }
 })

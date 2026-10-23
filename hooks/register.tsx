@@ -296,7 +296,7 @@ export const register: Register = on => {
 
     // Every color a theme key, so the box follows the person's theme: the goal's label in Claude's own.
     return (
-      <Box flexDirection="column" gap={1} borderStyle="round" borderColor="promptBorder" paddingX={1}>
+      <Box flexDirection="column" gap={1}>
         <Box flexDirection="column">
           {name && <Text bold color={STAGES[name]}>{name.toUpperCase()}</Text>}
           {text === null ? (

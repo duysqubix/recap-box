@@ -219,7 +219,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'recap-box',
-      description: 'Open the session recap box, or set the seconds between its checks',
+      description: 'Show or hide the session recap box, or set the seconds between its checks',
       argumentHint: '[update <seconds>]',
     })
     // The store is a file anyone can edit: a value out of range, or one that cannot be read, is the default.
@@ -237,7 +237,7 @@ export const register: Register = on => {
       const s = Number(/^update\s+(\d+)s?$/i.exec(e.args.trim())?.[1])
       if (!(s >= MIN_S && s <= MAX_S)) {
         return {
-          text: `/recap-box opens the box; /recap-box update <seconds>, from ${MIN_S} to ${MAX_S}, sets the time between checks. The box checks every ${every}s.`,
+          text: `/recap-box shows or hides the box; /recap-box update <seconds>, from ${MIN_S} to ${MAX_S}, sets the time between checks. The box checks every ${every}s.`,
         }
       }
       // Kept for later sessions, so saved first: a failed save changes nothing. The count starts over at the new length.
@@ -246,6 +246,13 @@ export const register: Register = on => {
       await update($, left, () => s)
 
       return { text: `The box checks every ${s}s.` }
+    }
+    // Shown, it hides; a tab behind another pane, or one waiting for room, comes to the front.
+    const pane = (await $.ui.panes()).find(p => p.id === PANE)
+    if (pane?.isShown && pane.isPlaced) {
+      await $.ui.close({ id: PANE })
+
+      return { text: 'Recap box closed.' }
     }
     await $.ui.open({ id: PANE, title: 'Recap', columns: 40 })
 

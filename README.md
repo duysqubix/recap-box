@@ -9,7 +9,7 @@ A Claude Code mod: a small box beside the transcript that says, in plain words, 
 - The recap and the goal use everyday words, with no jargon, no abbreviations and no names of files or code.
 - Once a minute by default, while the box is on screen, it reads the stage from the latest tool calls. When the transcript changed, it also asks Haiku for a new recap. A countdown at the bottom shows the next check.
 
-`/recap-box` opens the box again after you close it. `/recap-box update 30` makes it check every 30 seconds instead of 60, from 10 to 3600. Later sessions keep the setting; sessions already open keep theirs until they restart.
+`/recap-box` hides the box while it shows, and shows it again while it is hidden or behind another pane. `/recap-box update 30` makes it check every 30 seconds instead of 60, from 10 to 3600. Later sessions keep the setting; sessions already open keep theirs until they restart.
 
 ## Install
 

@@ -59,8 +59,21 @@ const engine = (
   on('command.register', () => ({ value: { command: 'recap-box' } }))
   on('store.get', (_, e) => ({ value: store.get(e.key) }))
   on('store.set', (_, e) => ({ value: void store.set(e.key, e.value) }))
-  on('ui.open', () => ({ value: { isPlaced: true } }))
-  on('ui.panes', () => ({ value: [{ id: 'recap', title: 'Recap', isShown: true, isFocused: false, isPlaced: true }] }))
+  // The box stays open until it is closed, and an open brings it back.
+  let isOpen = false
+  on('ui.open', () => {
+    isOpen = true
+
+    return { value: { isPlaced: true } }
+  })
+  on('ui.close', () => {
+    isOpen = false
+
+    return { value: undefined }
+  })
+  on('ui.panes', () => ({
+    value: isOpen ? [{ id: 'recap', title: 'Recap', isShown: true, isFocused: false, isPlaced: true }] : [],
+  }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.attach', (_, e) => ({ clientId: e.clientId }))
   on('session.end', async (_, e) => {
@@ -191,12 +204,14 @@ test('/recap-box update sets the seconds between checks, and later sessions keep
   // Out of range or no number changes nothing.
   for (const args of ['update 9', 'update 3601', 'update soon', 'update', 'faster', 'please update 30']) {
     expect(await run(args)).toBe(
-      '/recap-box opens the box; /recap-box update <seconds>, from 10 to 3600, sets the time between checks. The box checks every 20s.',
+      '/recap-box shows or hides the box; /recap-box update <seconds>, from 10 to 3600, sets the time between checks. The box checks every 20s.',
     )
   }
   expect(await run(' UPDATE 3600s ')).toBe('The box checks every 3600s.')
   expect(await run('update 10')).toBe('The box checks every 10s.')
   expect(store.get('every')).toBe(10)
+  // Shown since the start, the box hides, and shows again.
+  expect(await run('')).toBe('Recap box closed.')
   expect(await run('')).toBe('Recap box opened.')
   await ui.unmount()
 

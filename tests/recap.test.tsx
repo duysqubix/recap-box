@@ -126,6 +126,20 @@ test('the box recaps new activity once, with its stage, on every surface', async
   }
 })
 
+test('the empty box waits in a theme color, on every surface', async ($, on) => {
+  engine(on, [], () => ({ deny: 'nothing to recap' }))
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const waiting = await ui.find({ type: 'Text', text: /Waiting/ })
+    expect(waiting?.text).toBe('Waiting for activity.')
+    expect(waiting?.props.color).toBe('inactive')
+    await ui.unmount()
+  }
+})
+
 test('a burst of events makes one check, two seconds after the last', async ($, on) => {
   const clock = mock.clock(on)
   const messages: SessionMessage[] = []
@@ -968,7 +982,7 @@ test('the goal sits pinned under what is happening now, on every surface', async
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   await ends($, clock)
 
-  for (const surface of ['terminal', 'desktop'] as const) {
+  for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual([
       'CODING',
@@ -977,6 +991,13 @@ test('the goal sits pinned under what is happening now, on every surface', async
       'Make the box easy to read.',
     ])
     expect((await ui.find({ type: 'Text', text: 'GOAL' }))?.props.bold).toBe(true)
+    // Every color a theme key, so the box follows the person's theme.
+    expect((await ui.findAll({ type: 'Text' })).map(t => t.props.color)).toEqual([
+      'claude',
+      'text',
+      'claude',
+      'text',
+    ])
     await ui.unmount()
   }
 })

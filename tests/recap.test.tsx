@@ -595,7 +595,7 @@ test('the goal sits pinned under what is happening now, on every surface', async
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   await clock.advance(60_000)
 
-  for (const surface of ['terminal', 'desktop'] as const) {
+  for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual([
       'CODING',

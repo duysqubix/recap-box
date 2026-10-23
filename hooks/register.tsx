@@ -285,7 +285,7 @@ async function refresh($: EngineInterface) {
 export const register: Register = on => {
   // Opened on every start: the desktop app, VS Code and mobile attach after a start without a surface.
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'recap-box', description: 'Open the session recap box' })
+    await $.command.register({ name: 'recap-box', description: 'Show or hide the session recap box' })
     void $.ui.open({ id: PANE, title: 'Recap', columns: 40 })
     // A resumed session has a transcript already: recap it once the box is drawn.
     poke($, true)
@@ -302,7 +302,14 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'recap-box' }, async ($, e) => {
-    if (e.args.trim()) return { text: '/recap-box opens the box. It updates as the session works.' }
+    if (e.args.trim()) return { text: '/recap-box shows or hides the box. It updates as the session works.' }
+    // Shown, it hides; a tab behind another pane, or one waiting for room, comes to the front.
+    const pane = (await $.ui.panes()).find(p => p.id === PANE)
+    if (pane?.isShown && pane.isPlaced) {
+      await $.ui.close({ id: PANE })
+
+      return { text: 'Recap box closed.' }
+    }
     await $.ui.open({ id: PANE, title: 'Recap', columns: 40 })
     poke($, false)
 

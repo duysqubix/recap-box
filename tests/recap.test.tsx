@@ -70,8 +70,21 @@ const engine = (
 ) => {
   const entered: string[] = []
   on('command.register', () => ({ value: { command: 'recap-box' } }))
-  on('ui.open', () => ({ value: isPlaced() ? { isPlaced: true } : { isPlaced: false, reason: 'no surface' } }))
-  on('ui.panes', () => ({ value: [{ id: 'recap', title: 'Recap', isShown: true, isFocused: false, isPlaced: isPlaced() }] }))
+  // The box stays open until it is closed, and an open brings it back.
+  let isOpen = false
+  on('ui.open', () => {
+    isOpen = true
+
+    return { value: isPlaced() ? { isPlaced: true } : { isPlaced: false, reason: 'no surface' } }
+  })
+  on('ui.close', () => {
+    isOpen = false
+
+    return { value: undefined }
+  })
+  on('ui.panes', () => ({
+    value: isOpen ? [{ id: 'recap', title: 'Recap', isShown: true, isFocused: false, isPlaced: isPlaced() }] : [],
+  }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.attach', (_, e) => ({ clientId: e.clientId }))
   on('session.end', async (_, e) => {
@@ -590,7 +603,7 @@ test("a /clear drops the old conversation's pending check: nothing reads it whil
   await clock.advance(60_000)
 })
 
-test('/recap-box opens the box and checks it; with words it says what it does', async ($, on) => {
+test('/recap-box hides the box, opens it and checks it; with words it says what it does', async ($, on) => {
   const clock = mock.clock(on)
   const messages: SessionMessage[] = [{ role: 'user', text: 'one', toolUses: [] }]
   const prompts: string[] = []
@@ -609,6 +622,8 @@ test('/recap-box opens the box and checks it; with words it says what it does', 
   // Opened, the box reads the stage again; with no turn over, it asks for no recap.
   messages.push(did(EDIT))
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  // Shown since the start, the box hides, and shows again.
+  expect(await run('')).toBe('Recap box closed.')
   expect(await run('')).toBe('Recap box opened.')
   await clock.advance(2_000)
   expect((await ui.findAll({ type: 'Text' }))[0]?.text).toBe('CODING')
@@ -616,7 +631,7 @@ test('/recap-box opens the box and checks it; with words it says what it does', 
   await ui.unmount()
 
   for (const args of ['update 30', 'faster', ' please ']) {
-    expect(await run(args)).toBe('/recap-box opens the box. It updates as the session works.')
+    expect(await run(args)).toBe('/recap-box shows or hides the box. It updates as the session works.')
   }
 
   // The box's own command asks for nothing: it is no part of the goal.

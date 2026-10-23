@@ -11,7 +11,7 @@ A Claude Code mod: a small box beside the transcript that says, in plain words, 
 - After a `/resume`, the box recaps the transcript the resume brings once the engine has it in place. After a `/clear` it waits for new activity.
 - While the box waits undrawn (opened on its own on a terminal too narrow for it, or with no app attached) it reads nothing. A recap that came due meanwhile is written once the box is drawn. A box drawn but behind another tab still reads.
 
-`/recap-box` opens the box again after you close it.
+`/recap-box` hides the box while it shows, and shows it again while it is hidden or behind another pane.
 
 ## Install
 

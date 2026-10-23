@@ -1,5 +1,14 @@
 import { expect, mock, test } from 'claude-code/testing'
-import type { ModelCompleteInput, ModelCompleteResult, On, PromptOrigin, SessionEndInput, SessionMessage, ToolUseSummary } from 'claude-code'
+import type {
+  AgentInfo,
+  ModelCompleteInput,
+  ModelCompleteResult,
+  On,
+  PromptOrigin,
+  SessionEndInput,
+  SessionMessage,
+  ToolUseSummary,
+} from 'claude-code'
 
 const PANE = {
   plugin: 'recap-box',
@@ -33,21 +42,27 @@ const use = (tool: string, input: Record<string, unknown>, isError?: true): Tool
 const did = (...toolUses: ToolUseSummary[]): SessionMessage => ({ role: 'assistant', text: '', toolUses })
 const EDIT = use('Edit', { file_path: '/r/hooks/register.tsx' })
 const READ = use('Read', { file_path: '/r/hooks/register.tsx' })
+const sh = (command: string, isError?: true) => use('Bash', { command }, isError)
 
 // Answers with what reached it; the prompt stand-in masks a key and drops a marked prompt, as a settings hook might.
 const engine = (
   on: On,
   messages: SessionMessage[] | (() => Promise<SessionMessage[]>),
   model: (e: ModelCompleteInput) => Answer | Promise<Answer>,
+  agents: AgentInfo[] = [],
+  store = new Map<string, unknown>(),
 ) => {
   const entered: string[] = []
   on('command.register', () => ({ value: { command: 'recap-box' } }))
+  on('store.get', (_, e) => ({ value: store.get(e.key) }))
+  on('store.set', (_, e) => ({ value: void store.set(e.key, e.value) }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('ui.panes', () => ({ value: [{ id: 'recap', title: 'Recap', isShown: true, isFocused: false, isPlaced: true }] }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.attach', (_, e) => ({ clientId: e.clientId }))
   on('session.end', (_, e) => ({ sessionId: e.sessionId }))
   on('session.messages', async () => ({ value: Array.isArray(messages) ? [...messages] : await messages() }))
+  on('agent.list', () => ({ value: [...agents] }))
   on('model.complete', async (_, e) => model(e))
   on('prompt.submit', (_, e) => {
     entered.push(e.text)
@@ -129,6 +144,55 @@ test('a check runs every 60th second, never sooner', async ($, on) => {
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /A recap/ }))?.text).toBe('A recap.')
+  await ui.unmount()
+})
+
+test('/recap-box update sets the seconds between checks, and later sessions keep them', async ($, on) => {
+  const clock = mock.clock(on)
+  const store = new Map<string, unknown>()
+  const messages: SessionMessage[] = [{ role: 'user', text: 'one', toolUses: [] }]
+  let calls = 0
+  engine(
+    on,
+    messages,
+    () => {
+      calls += 1
+
+      return say('Now: Working.')
+    },
+    [],
+    store,
+  )
+  const run = async (args: string) =>
+    (await $.command.run({ command: 'recap-box', args, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })).text
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const countdown = async () => (await ui.find({ type: 'Text', text: /next check/ }))?.text
+
+  // Mid-count, the count starts over at the new length.
+  await clock.advance(5_000)
+  expect(await run('update 20')).toBe('The box checks every 20s.')
+  expect(await countdown()).toBe('next check in 20s')
+  await clock.advance(19_000)
+  expect(calls).toBe(0)
+  await clock.advance(1_000)
+  expect(calls).toBe(1)
+  expect(await countdown()).toBe('next check in 20s')
+
+  // Out of range or no number changes nothing.
+  for (const args of ['update 9', 'update 3601', 'update soon', 'update', 'faster', 'please update 30']) {
+    expect(await run(args)).toBe('Usage: /recap-box update <seconds>, from 10 to 3600. The box checks every 20s.')
+  }
+  expect(await run(' UPDATE 3600s ')).toBe('The box checks every 3600s.')
+  expect(await run('update 10')).toBe('The box checks every 10s.')
+  expect(store.get('every')).toBe(10)
+  expect(await run('')).toBe('Recap box opened.')
+
+  // A later session, or a reload, starts at the kept length.
+  await clock.advance(3_000)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  expect(await countdown()).toBe('next check in 10s')
   await ui.unmount()
 })
 
@@ -236,28 +300,48 @@ test('each kind of tool call names its stage', async ($, on) => {
 
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const agent = (subagent_type: string, description: string) => use('Agent', { subagent_type, description, prompt: 'p' })
   const cases: [ToolUseSummary, string][] = [
     [use('Read', { file_path: '/r/README.md' }), 'RESEARCHING'],
-    // Quoted words, a test file's name and a word that ends in one run nothing.
-    [use('Bash', { command: 'grep -n "git push origin" README.md' }), 'RESEARCHING'],
-    [use('Bash', { command: 'sed -n 1,9p tests/recap.test.tsx' }), 'RESEARCHING'],
-    [use('Bash', { command: 'cat logs/latest' }), 'RESEARCHING'],
+    // A shell command goes by the commands it starts: quotes, arguments, file names and heredoc text run nothing.
+    [sh('grep -n "git push origin" README.md'), 'RESEARCHING'],
+    [sh('sed -n 1,9p tests/recap.test.tsx'), 'RESEARCHING'],
+    [sh('cat logs/latest'), 'RESEARCHING'],
+    [sh('test -f x || echo check && ls /tmp/test && command -v tsc'), 'RESEARCHING'],
+    [sh('grep -rn "a && npm test" src'), 'RESEARCHING'],
+    // A search that finds nothing exits with an error, and is still no failed test.
+    [sh('grep -rn test src', true), 'RESEARCHING'],
+    [sh("cat > notes.md <<'EOF'\n- check the pane\nnpm test\nelse: deploy\nEOF\nwc -l notes.md"), 'RESEARCHING'],
+    [sh('sed -n 1,40p ~/.claude/scripts/ci-watch && bd create "Fix the deploy step"'), 'RESEARCHING'],
+    // Reading a pull request or a CI run is a look.
+    [sh('gh pr view 12 && gh run view 34 --log-failed'), 'RESEARCHING'],
     [use('Agent', { subagent_type: 'Plan', description: 'Plan the change', prompt: 'p' }), 'PLANNING'],
     [use('ExitPlanMode', {}), 'PLANNING'],
+    [use('Skill', { skill: 'oh-my-claudecode:ralplan' }), 'PLANNING'],
     // An agent of no named kind goes by its task.
-    [use('Agent', { subagent_type: 'general-purpose', description: 'Research the engine docs', prompt: 'p' }), 'RESEARCHING'],
+    [agent('general-purpose', 'Research the engine docs'), 'RESEARCHING'],
     // A task word inside another word names none: no stage, so the recap shows first.
-    [use('Agent', { subagent_type: 'general-purpose', description: 'Retrace the latest release', prompt: 'p' }), 'Working.'],
+    [agent('general-purpose', 'Retrace the latest release'), 'Working.'],
+    [agent('general-purpose', 'Fix the critical bug'), 'Working.'],
     [EDIT, 'CODING'],
-    // A builder's task that names a critical bug is no review.
-    [use('Agent', { subagent_type: 'oh-my-claudecode:executor', description: 'Fix the critical bug', prompt: 'p' }), 'CODING'],
-    [use('Bash', { command: 'cd /r && claude plugin test .' }), 'TESTING'],
-    [use('Bash', { command: 'cargo test' }, true), 'DEBUGGING'],
-    [use('Agent', { subagent_type: 'oh-my-claudecode:code-reviewer', description: 'Review the diff', prompt: 'p' }), 'REVIEWING'],
+    // An agent of a named kind goes by its kind, whatever its task says.
+    [agent('oh-my-claudecode:executor', 'Apply the review fixes from the plan to the tests'), 'CODING'],
+    [sh('cd /r && claude plugin test .'), 'TESTING'],
+    [sh('npm run test:unit'), 'TESTING'],
+    [sh('npm run typecheck'), 'TESTING'],
+    [sh('CI=1 timeout 300 ./node_modules/.bin/vitest run 2>&1 | tail -5'), 'TESTING'],
+    [sh('yes | npm test'), 'TESTING'],
+    [sh('cargo test', true), 'DEBUGGING'],
+    // A run sent to the background answers when it starts, not how it ends.
+    [use('Bash', { command: 'npm test', run_in_background: true }, true), 'TESTING'],
+    [agent('oh-my-claudecode:code-reviewer', 'Review the diff'), 'REVIEWING'],
     [use('Skill', { skill: 'code-review' }), 'REVIEWING'],
     [use('Write', { file_path: '/r/README.md' }), 'WRITING'],
-    [use('Bash', { command: 'git add -A && git commit -m "Pin the goal" && git push' }), 'SHIPPING'],
-    [use('Bash', { command: '~/.claude/scripts/ci-watch' }), 'SHIPPING'],
+    [sh('git add -A && git commit -m "Pin the goal" && git push'), 'SHIPPING'],
+    // Sending work out outranks the checks before it.
+    [sh('npm test && git -C /r push'), 'SHIPPING'],
+    [sh('~/.claude/scripts/ci-watch'), 'SHIPPING'],
+    [agent('oh-my-claudecode:git-master', 'Commit and push'), 'SHIPPING'],
   ]
   for (const [call, stage] of cases) {
     await $.session.end(CLEAR)
@@ -268,9 +352,9 @@ test('each kind of tool call names its stage', async ($, on) => {
   await ui.unmount()
 })
 
-test('the stage is what most of the last ten calls do, the newest on a tie', async ($, on) => {
+test('the stage is the newest of the last five calls that does more than look', async ($, on) => {
   const clock = mock.clock(on)
-  const messages: SessionMessage[] = [did(EDIT, EDIT, EDIT, EDIT, EDIT, EDIT, READ, READ, READ, READ)]
+  const messages: SessionMessage[] = [did(EDIT, sh('git commit -m x'), READ, READ, READ)]
   engine(on, messages, () => say('Now: Working.'))
 
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
@@ -278,40 +362,92 @@ test('the stage is what most of the last ten calls do, the newest on a tie', asy
   const shown = async () => (await ui.findAll({ type: 'Text' }))[0]?.text
 
   await clock.advance(60_000)
-  expect(await shown()).toBe('CODING')
+  expect(await shown()).toBe('SHIPPING')
   // A call no rule names casts no vote.
   messages.push(did(use('ToolSearch', { query: 'x' }), use('SendMessage', { to: 'a', message: 'm' }), use('mcp__db__query', { sql: 's' })))
   await clock.advance(60_000)
-  expect(await shown()).toBe('CODING')
-  // One more look ties the last ten at five each.
+  expect(await shown()).toBe('SHIPPING')
+  // The commit is the fifth call back, then the sixth.
+  messages.push(did(READ))
+  await clock.advance(60_000)
+  expect(await shown()).toBe('SHIPPING')
   messages.push(did(READ))
   await clock.advance(60_000)
   expect(await shown()).toBe('RESEARCHING')
   await ui.unmount()
 })
 
-test('a failed check reads as debugging until a check passes', async ($, on) => {
+test('a failed test run reads as debugging while it is among the last five calls', async ($, on) => {
   const clock = mock.clock(on)
-  const messages: SessionMessage[] = [did(EDIT, use('Bash', { command: 'npm test' }))]
+  const messages: SessionMessage[] = [did(EDIT, sh('npm test'))]
   engine(on, messages, () => say('Now: Working.'))
 
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   const shown = async () => (await ui.findAll({ type: 'Text' }))[0]?.text
+  const after = async (...toolUses: ToolUseSummary[]) => {
+    messages.push(did(...toolUses))
+    await clock.advance(60_000)
 
-  // A check still running is testing; its failure shows at the next check, though the transcript reads the same.
+    return shown()
+  }
+
+  // A run still going is testing; its failure shows at the next check, though the transcript reads the same.
   await clock.advance(60_000)
   expect(await shown()).toBe('TESTING')
-  messages[0] = did(EDIT, use('Bash', { command: 'npm test' }, true))
+  messages[0] = did(EDIT, sh('npm test', true))
   await clock.advance(60_000)
   expect(await shown()).toBe('DEBUGGING')
-  // Looking and fixing after it is still debugging.
-  messages.push(did(READ, EDIT, EDIT))
-  await clock.advance(60_000)
-  expect(await shown()).toBe('DEBUGGING')
-  messages.push(did(use('Bash', { command: 'npm test' })))
+  // Looking and fixing after it is still debugging; a run that passes ends it.
+  expect(await after(READ, EDIT, EDIT)).toBe('DEBUGGING')
+  expect(await after(sh('npm test'))).toBe('TESTING')
+  // A failure five calls back still shows; six calls back it is over.
+  expect(await after(sh('npm test', true))).toBe('DEBUGGING')
+  expect(await after(READ, READ, READ, READ)).toBe('DEBUGGING')
+  expect(await after(READ)).toBe('RESEARCHING')
+  await ui.unmount()
+})
+
+test('a helper agent at work shows while the session waits on it or only looks', async ($, on) => {
+  const clock = mock.clock(on)
+  const messages: SessionMessage[] = [did(EDIT, READ), { role: 'assistant', text: 'Waiting on the review.', toolUses: [] }]
+  const agents: AgentInfo[] = []
+  engine(on, messages, () => say('Now: Working.'), agents)
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const shown = async () => (await ui.findAll({ type: 'Text' }))[0]?.text
+  // Named by its kind: its task's words name no stage.
+  const reviewer: AgentInfo = { id: 'a1', description: 'Second look at the diff', type: 'oh-my-claudecode:code-reviewer', status: 'running' }
+
+  // A plugin's agent, or one inside another agent, is not the session's helper.
+  agents.push({ ...reviewer, id: 'a2', spawnedBy: 'notes' }, { ...reviewer, id: 'a3', parentId: 'a1' })
   await clock.advance(60_000)
   expect(await shown()).toBe('CODING')
+  // It shows from the check after it starts, though the transcript reads the same.
+  agents.push(reviewer)
+  await clock.advance(60_000)
+  expect(await shown()).toBe('REVIEWING')
+  // Back at work, the session's own calls show, and still once a call's result is the newest row.
+  const look = use('Read', { file_path: '/r/README.md' })
+  messages.push(did(look))
+  await clock.advance(60_000)
+  expect(await shown()).toBe('CODING')
+  messages.push({ role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: look.tool_use_id, text: 'one line', isError: false }] })
+  await clock.advance(60_000)
+  expect(await shown()).toBe('CODING')
+  // Once the last five calls only look, the helper's again.
+  messages.push(did(READ, READ, READ, READ))
+  await clock.advance(60_000)
+  expect(await shown()).toBe('REVIEWING')
+  // A helper that is done shows no more.
+  agents.splice(0, agents.length, { ...reviewer, status: 'completed' })
+  await clock.advance(60_000)
+  expect(await shown()).toBe('RESEARCHING')
+  // A helper of no named kind goes by its task.
+  agents.push({ id: 'a4', description: 'Plan the release', type: 'general-purpose', status: 'running' })
+  await clock.advance(60_000)
+  expect(await shown()).toBe('PLANNING')
   await ui.unmount()
 })
 
@@ -348,7 +484,10 @@ test('the goal holds until a reply names a new one', async ($, on) => {
     'Now: Checking it again.\nGoal: none',
     'Now: Fixing a slip.\n**Goal:** "same"',
     'Now: Nearly done.\nGoal: Unchanged.',
-    'Now: Sharing it.\nGoal: Build a recap box and share it.',
+    'Now: Tidying up.\nGoal: No changes.',
+    'Now: Wrapping up.\nGoal: Still the same one.',
+    // Past four words, a goal that names "same" is a new goal.
+    'Now: Sharing it.\nGoal: Share the same box everywhere.',
   ]
   engine(on, messages, e => {
     prompts.push(e.prompt)
@@ -363,18 +502,19 @@ test('the goal holds until a reply names a new one', async ($, on) => {
 
   await clock.advance(60_000)
   expect(await shown()).toEqual(['Working out the plan.', 'GOAL', 'Build a recap box.'])
-  for (const now of ['Writing the box.', 'Checking that the box works.', 'Checking it again.', 'Fixing a slip.', 'Nearly done.']) {
+  const nows = ['Writing the box.', 'Checking that the box works.', 'Checking it again.', 'Fixing a slip.', 'Nearly done.', 'Tidying up.', 'Wrapping up.']
+  for (const now of nows) {
     messages.push({ role: 'assistant', text: String(messages.length), toolUses: [] })
     await clock.advance(60_000)
     expect(await shown()).toEqual([now, 'GOAL', 'Build a recap box.'])
   }
   messages.push({ role: 'user', text: 'now share it', toolUses: [] })
   await clock.advance(60_000)
-  expect(await shown()).toEqual(['Sharing it.', 'GOAL', 'Build a recap box and share it.'])
+  expect(await shown()).toEqual(['Sharing it.', 'GOAL', 'Share the same box everywhere.'])
   await ui.unmount()
 
   // Each check is shown the goal it may keep.
-  expect(prompts.map(p => p.split('\n')[0])).toEqual(['Goal so far: none', ...Array(6).fill('Goal so far: Build a recap box.')])
+  expect(prompts.map(p => p.split('\n')[0])).toEqual(['Goal so far: none', ...Array(8).fill('Goal so far: Build a recap box.')])
 })
 
 test("the goal reads the person's own prompts, the first and the newest eight", async ($, on) => {

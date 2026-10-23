@@ -1,9 +1,14 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, PromptOrigin, Register, SessionMessage, ThemeKey, ToolUseSummary } from 'claude-code'
+import type { AgentInfo, EngineInterface, PromptOrigin, Register, SessionMessage, ThemeKey, ToolUseSummary } from 'claude-code'
 import type { Stage } from '../types'
 
 const PANE = 'recap'
 const EVERY_S = 60
+// The seconds `/recap-box update` takes: at most one Haiku call each check, and a check at least hourly.
+const MIN_S = 10
+const MAX_S = 3600
+// Seconds between checks, read from the store at each start.
+let every = EVERY_S
 const recap = atom({ plugin: 'recap-box', key: 'recap' } as const, null)
 // What the whole session works toward, pinned under the recap.
 const goal = atom({ plugin: 'recap-box', key: 'goal' } as const, null)
@@ -27,42 +32,84 @@ const STAGES: Record<Stage, ThemeKey> = {
 }
 
 // What a call says the work is, first match wins; a call no rule names casts no vote.
-// A word counts from its start ("latest" is no test), and a shell word only where a
-// command starts or stands alone ("recap.test.tsx" runs no test).
+// A word counts from its start: "latest" is no test, "critical" no review.
 const RULES: [RegExp, Stage][] = [
   [/^(Agent|Skill) .*\b(review|verif|critic\b|audit)|^ReportFindings/i, 'reviewing'],
-  [/^(Agent|Skill) .*\b(plan|architect|analyst)|^(Enter|Exit)PlanMode/i, 'planning'],
+  [/^(Agent|Skill) .*\b(plan|ralplan|architect|analyst)|^(Enter|Exit)PlanMode/i, 'planning'],
   [/^(Agent|Skill) .*\b(debug|trac(e|ing))/i, 'debugging'],
   [/^(Agent|Skill) .*\b(explore|research|search|document-specialist)/i, 'researching'],
   [/^(Agent|Skill) .*\bwriter/i, 'writing'],
   [/^(Agent|Skill) .*\b(test|qa)/i, 'testing'],
   [/^(Agent|Skill) .*\b(execut|build|implement)/i, 'coding'],
-  [/^Bash (.*[\s;&|(/])?(git (push|commit|tag)|gh (pr|release|run)|publish|deploy|ci-watch)([\s;&|)]|$)/s, 'shipping'],
-  [/^Bash (.*[\s;&|(/])?(test|pytest|jest|vitest|tsc|validate|lint|check|clippy|ruff|mypy)([\s;&|)]|$)/s, 'testing'],
+  [/^(Agent|Skill) .*\bgit-master/i, 'shipping'],
   [/^(Edit|Write|NotebookEdit) .*\.(md|mdx|txt|rst)$/i, 'writing'],
   [/^(Edit|Write|NotebookEdit) /, 'coding'],
-  // Most other shell commands only look: grep, sed, cat, ls, git show.
-  [/^(Read|Grep|Glob|WebSearch|WebFetch|LSP|Bash) /, 'researching'],
+  [/^(Read|Grep|Glob|WebSearch|WebFetch|LSP) /, 'researching'],
 ]
 
-// A call as one line for the rules: the tool, then what it ran, touched, or was sent to do.
-const call = ({ tool, input: i }: ToolUseSummary) =>
-  `${tool} ${String(i.command ?? i.file_path ?? i.notebook_path ?? [i.subagent_type, i.skill, i.description].join(' '))}`
+// A rule's stage for what a call names, then with its task's words: an agent or a skill
+// goes by its kind, and by its task only when the kind names no stage.
+const named = (head: string, task?: unknown) =>
+  (RULES.find(([re]) => re.test(head)) ?? (task ? RULES.find(([re]) => re.test(`${head} ${String(task)}`)) : undefined))?.[1]
 
-// The stage the tail's calls show: most of the last ten votes, the newest on a tie,
-// and debugging while the newest check among them failed.
-function stageOf(messages: readonly SessionMessage[]): Stage | undefined {
+// A shell command goes by the commands it starts, never by an argument, a quote or a
+// heredoc's text: "grep -rn test" looks, "npm test" tests. Every other command looks.
+const HEREDOC = /<<-?\s*(['"]?)(\w+)\1[^\n]*\n[\s\S]*?\n\s*\2[ \t]*(?=\n|$)/g
+const QUOTED = /'[^']*'|"(\\.|[^"\\])*"/g
+// What leads a command without being one: a variable, time, timeout 60, then.
+const LEAD = /^([A-Za-z_]\w*=\S*|time|env|sudo|nohup|exec|if|then|else|while|until|do|!|timeout|\d+[smh]?)$/
+// Only what sends work out: reading a pull request or a CI run is a look.
+const SHIP =
+  /^(git( -[Cc] \S+)* (push|commit|tag)|gh (pr (create|merge|ready)|release create|run (watch|rerun))|ci-watch|deploy|(npm|pnpm|yarn|bun|cargo|uv|poetry) publish)\b/
+const TEST =
+  /^((pytest|jest|vitest|tsc|ruff|mypy|eslint)|(npm|npx|pnpm|yarn|bun|bunx|uv|cargo|go|make|deno|poetry|python3?|claude)( -\S+| run| exec| x| plugin)* (test|check|validate|lint|clippy|typecheck|pytest|jest|vitest|tsc|ruff|mypy|eslint))\b/
+
+function shellStage(command: string): Stage {
+  const commands = command
+    .replace(HEREDOC, '')
+    .replace(QUOTED, '""')
+    .split(/&&|\|\||[;|&\n(`{]|\$\(/)
+    .map(part => {
+      const words = part.split(/\s+/).filter(Boolean)
+      while (words[0] && LEAD.test(words[0])) words.shift()
+      // A program by its name, wherever it lives: ~/.claude/scripts/ci-watch, node_modules/.bin/vitest.
+      return [words[0]?.split('/').pop(), ...words.slice(1)].join(' ')
+    })
+  if (commands.some(c => SHIP.test(c))) return 'shipping'
+
+  return commands.some(c => TEST.test(c)) ? 'testing' : 'researching'
+}
+
+// A call by what it ran, the file it touched, or the kind of agent or skill it started.
+const callStage = ({ tool, input: i }: ToolUseSummary) =>
+  tool === 'Bash'
+    ? shellStage(String(i.command ?? ''))
+    : named(`${tool} ${String(i.file_path ?? i.notebook_path ?? i.subagent_type ?? i.skill ?? '')}`, i.description)
+
+// The newest work: of the last five calls, the newest that does more than look, and debugging
+// while the newest test run among them failed. A helper agent at work shows while the session
+// waits on it or only looks.
+function stageOf(messages: readonly SessionMessage[], agents: readonly AgentInfo[]): Stage | undefined {
   const votes = messages
     .flatMap(m => m.toolUses)
     .flatMap(t => {
-      const s = RULES.find(([re]) => re.test(call(t)))?.[1]
-      return s ? [{ s, isError: t.isError }] : []
+      const s = callStage(t)
+      return s ? [{ s, t }] : []
     })
-    .slice(-10)
-  if (votes.filter(v => v.s === 'testing').pop()?.isError) return 'debugging'
-  const n = (s: Stage) => votes.filter(v => v.s === s).length
+    .slice(-5)
+  // A run sent to the background answers when it starts, not how it ends.
+  if (votes.filter(v => v.s === 'testing' && !v.t.input.run_in_background).pop()?.t.isError) return 'debugging'
+  // The session's own helpers: not a plugin's, nor one inside another agent.
+  const helper = agents
+    .filter(a => a.status === 'running' && !a.parentId && !a.spawnedBy)
+    .map(a => named(`Agent ${a.type}`, a.description))
+    .filter(s => s !== undefined)
+    .pop()
+  // The model spoke last and called nothing: its turn is over.
+  const last = messages.at(-1)
+  const isWaiting = last?.role === 'assistant' && !last.toolUses.length
 
-  return votes.map(v => v.s).reverse().sort((a, b) => n(b) - n(a))[0]
+  return (isWaiting && helper) || votes.findLast(v => v.s !== 'researching')?.s || helper || votes.at(-1)?.s
 }
 
 const SYSTEM =
@@ -96,10 +143,10 @@ const transcript = (messages: readonly SessionMessage[]) =>
 // One line of plain text: a Text refuses control characters.
 const clean = (text: string) => text.replace(/[\x00-\x1f\x7f-\x9f\s]+/g, ' ').trim()
 
-// The reply's labeled lines, in either order; a goal that says it is unchanged keeps the pinned one.
+// The reply's labeled lines, in either order; a short goal that says it still fits keeps the pinned one.
 const GOAL = /^\W*goal\W*:[\s*]*(.*)$/im
 const NOW = /^\W*now\W*:[\s*]*/im
-const SAME = /^\W*(the )?(same|unchanged|no change|none)\b/i
+const isSame = (aim: string) => aim.split(' ').length <= 4 && /\b(same|unchanged|no changes?|none)\b/i.test(aim)
 
 // A cut can split an emoji's pair, and the API refuses a lone half: keep whole pairs, drop halves.
 const whole = (text: string) => text.replace(/([\ud800-\udbff][\udc00-\udfff])|[\ud800-\udfff]/g, '$1')
@@ -117,10 +164,10 @@ async function refresh($: EngineInterface) {
     const panes = await $.ui.panes()
     if (!panes.some(p => p.id === PANE && p.isPlaced)) return
     const recent = (await $.session.messages()).slice(-60)
-    // Read at every check: a call's result can land while the transcript reads the same.
+    // Read at every check: a call's result can land, or a helper start or end, while the transcript reads the same.
     // A /clear while this check ran makes it the old conversation's. Checked inside
     // update: a write that races session.end's re-runs and keeps its null.
-    const name = stageOf(recent)
+    const name = stageOf(recent, await $.agent.list())
     if (name) await update($, stage, old => (at === epoch ? name : old))
     // Compared by content: messages() holds only the newest 4096 rows, so a count stalls.
     const tail = transcript(recent)
@@ -146,7 +193,7 @@ async function refresh($: EngineInterface) {
       const aim = clean(reply.text.match(GOAL)?.[1] ?? '')
       const now = clean(reply.text.replace(GOAL, '').replace(NOW, ''))
       await update($, recap, old => (at === epoch ? now || old : old))
-      if (aim && !SAME.test(aim)) await update($, goal, old => (at === epoch ? aim : old))
+      if (aim && !isSame(aim)) await update($, goal, old => (at === epoch ? aim : old))
     }
   } catch (err) {
     // Only a request the engine refuses to send rejects (a blocked model): say so in the box.
@@ -158,20 +205,38 @@ async function refresh($: EngineInterface) {
 
 // Each second: count the box down, and at zero check for new activity.
 async function tick($: EngineInterface) {
-  if ((await update($, left, n => (n > 1 ? n - 1 : EVERY_S))) === EVERY_S) await refresh($)
+  if ((await update($, left, n => (n > 1 ? n - 1 : every))) === every) await refresh($)
 }
 
 export const register: Register = on => {
   // Opened on every start: the desktop app, VS Code and mobile attach after a start without a surface.
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'recap-box', description: 'Open the session recap box' })
+    await $.command.register({
+      name: 'recap-box',
+      description: 'Open the session recap box, or set the seconds between its checks',
+      argumentHint: '[update <seconds>]',
+    })
+    every = Number(await $.store.get('every')) || EVERY_S
+    await update($, left, () => every)
     void $.ui.open({ id: PANE, title: 'Recap', columns: 40 })
     $.clock.every(1000, () => void tick($))
 
     return next(e)
   })
 
-  on('command.run', { command: 'recap-box' }, async $ => {
+  on('command.run', { command: 'recap-box' }, async ($, e) => {
+    if (e.args.trim()) {
+      const s = Number(/^update\s+(\d+)s?$/i.exec(e.args.trim())?.[1])
+      if (!(s >= MIN_S && s <= MAX_S)) {
+        return { text: `Usage: /recap-box update <seconds>, from ${MIN_S} to ${MAX_S}. The box checks every ${every}s.` }
+      }
+      // Kept for later sessions; the count starts over at the new length.
+      every = s
+      await $.store.set('every', s)
+      await update($, left, () => s)
+
+      return { text: `The box checks every ${s}s.` }
+    }
     await $.ui.open({ id: PANE, title: 'Recap', columns: 40 })
 
     return { text: 'Recap box opened.' }

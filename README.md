@@ -3,12 +3,13 @@
 A Claude Code mod: a small box beside the transcript that says, in plain words, what the session is doing now and what it is working toward.
 
 - On top: the stage of the work and one or two sentences on what is happening now. The stage is one of researching, planning, coding, testing, debugging, reviewing, writing or shipping, each in its own theme color.
-- The stage comes from the tools the session runs, not from a guess. Reading and searching is researching. Edits are coding, or writing when they change docs. Test runs are testing, review agents are reviewing, and commits, pushes and CI runs are shipping. The stage is what most of the last ten calls did. A failed test run among the last ten shows debugging until a run passes.
+- The stage comes from the tools the session runs, not from a guess. It is the newest of the last five calls that does more than look. Edits are coding, or writing when they change docs. Test runs are testing, review agents are reviewing, and commits, pushes and CI watches are shipping. A shell command counts by the commands it starts, so `grep -rn test` is a look and `npm test` a test run.
+- When the last five calls only read, search or run other commands, the stage is what a helper agent at work does, or researching. While the session waits on a helper agent, the stage is the helper's. A failed test run among the last five shows debugging.
 - Below, pinned: the goal of the whole session, drawn from what you asked for. Haiku keeps it until your requests move on. The box sees only what you ask after it loads, so in a resumed session the goal starts from the transcript.
 - The recap and the goal use everyday words, with no jargon, no abbreviations and no names of files or code.
-- Once a minute the box checks the transcript. When the transcript changed and the box is on screen, it reads the stage and asks Haiku for a new recap. A countdown at the bottom shows the next check.
+- Once a minute, while the box is on screen, it reads the stage from the latest tool calls. When the transcript changed, it also asks Haiku for a new recap. A countdown at the bottom shows the next check.
 
-`/recap-box` opens the box again after you close it.
+`/recap-box` opens the box again after you close it. `/recap-box update 30` makes it check every 30 seconds instead of 60, from 10 to 3600. Later sessions keep the setting; sessions already open keep theirs until they restart.
 
 ## Install
 

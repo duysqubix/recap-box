@@ -1,4 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
+import type { Engine, MockClock } from 'claude-code/testing'
 import type {
   AgentInfo,
   ModelCompleteInput,
@@ -8,6 +9,7 @@ import type {
   SessionEndInput,
   SessionMessage,
   ToolUseSummary,
+  TurnCompleteInput,
 } from 'claude-code'
 
 const PANE = {
@@ -30,6 +32,7 @@ const USAGE = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, c
 type Answer = { value: ModelCompleteResult } | { deny: string }
 const say = (text: string): Answer => ({ value: { isAnswered: true, text, usage: USAGE } })
 const CLEAR: SessionEndInput = { reason: 'clear', sessionId: 's1', resume: { id: 's1' } }
+const END: TurnCompleteInput = { answer: '', durationMs: 0, isAborted: false, turnId: 't1', reason: 'answer' }
 
 // A tool call, and an assistant turn that only makes calls.
 let ids = 0
@@ -44,23 +47,31 @@ const EDIT = use('Edit', { file_path: '/r/hooks/register.tsx' })
 const READ = use('Read', { file_path: '/r/hooks/register.tsx' })
 const sh = (command: string, isError?: true) => use('Bash', { command }, isError)
 
-// The store and the end of a session, as a test may stand them in.
-type Store = { get: (key: string) => unknown; set: (key: string, value: unknown) => unknown }
-type Options = { agents?: AgentInfo[]; store?: Store; end?: () => Promise<void> }
+// The session's turn ends, and the check after it has run, past the gap between recaps.
+const ends = async ($: Engine, clock: MockClock) => {
+  await $.turn.complete(END)
+  await clock.advance(10_000)
+}
+// A call of the session's, and the check after it.
+const calls = async ($: Engine, clock: MockClock) => {
+  await $.tool.call({ tool: 'Read', file_path: '/r/README.md' })
+  await clock.advance(2_000)
+}
+
+// The end of a session and whether the box is drawn, as a test may stand them in.
+type Options = { agents?: AgentInfo[]; end?: () => Promise<void>; isPlaced?: () => boolean }
 
 // Answers with what reached it; the prompt stand-in masks a key and drops a marked prompt, as a settings hook might.
 const engine = (
   on: On,
   messages: SessionMessage[] | (() => Promise<SessionMessage[]>),
   model: (e: ModelCompleteInput) => Answer | Promise<Answer>,
-  { agents = [], store = new Map(), end }: Options = {},
+  { agents = [], end, isPlaced = () => true }: Options = {},
 ) => {
   const entered: string[] = []
   on('command.register', () => ({ value: { command: 'recap-box' } }))
-  on('store.get', (_, e) => ({ value: store.get(e.key) }))
-  on('store.set', (_, e) => ({ value: void store.set(e.key, e.value) }))
-  on('ui.open', () => ({ value: { isPlaced: true } }))
-  on('ui.panes', () => ({ value: [{ id: 'recap', title: 'Recap', isShown: true, isFocused: false, isPlaced: true }] }))
+  on('ui.open', () => ({ value: isPlaced() ? { isPlaced: true } : { isPlaced: false, reason: 'no surface' } }))
+  on('ui.panes', () => ({ value: [{ id: 'recap', title: 'Recap', isShown: true, isFocused: false, isPlaced: isPlaced() }] }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.attach', (_, e) => ({ clientId: e.clientId }))
   on('session.end', async (_, e) => {
@@ -71,6 +82,10 @@ const engine = (
   on('session.messages', async () => ({ value: Array.isArray(messages) ? [...messages] : await messages() }))
   on('agent.list', () => ({ value: [...agents] }))
   on('model.complete', async (_, e) => model(e))
+  on('tool.call', () => ({ result: {} }))
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('turn.complete', (_, e) => ({ text: e.answer }))
+  on('classic.SessionStart', () => ({}))
   on('prompt.submit', (_, e) => {
     entered.push(e.text)
 
@@ -92,10 +107,10 @@ test('the box recaps new activity once, with its stage, on every surface', async
 
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   messages.push({ role: 'user', text: 'make a recap box <system-reminder>noise</system-reminder>', toolUses: [] }, did(EDIT))
-  await clock.advance(60_000)
-  await clock.advance(60_000)
+  await ends($, clock)
+  await ends($, clock)
 
-  // Two checks, one change: one model call, reminders stripped.
+  // Two turns, one change: one model call, reminders stripped.
   expect(prompts.length).toBe(1)
   expect(prompts[0]).toContain('user: make a recap box')
   expect(prompts[0]).not.toContain('noise')
@@ -111,177 +126,506 @@ test('the box recaps new activity once, with its stage, on every surface', async
   }
 })
 
-test('the open box counts down to the next check, on every surface', async ($, on) => {
-  const clock = mock.clock(on)
+test('the empty box waits in a theme color, on every surface', async ($, on) => {
   engine(on, [], () => ({ deny: 'nothing to recap' }))
 
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
 
-  // Mounted first, so each count is a redraw of the open box.
-  for (const [surface, shown] of [['terminal', 'next check in 45s'], ['desktop', 'next check in 30s']] as const) {
+  for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     const waiting = await ui.find({ type: 'Text', text: /Waiting/ })
     expect(waiting?.text).toBe('Waiting for activity.')
     expect(waiting?.props.color).toBe('inactive')
-    await clock.advance(15_000)
-    expect((await ui.find({ type: 'Text', text: /next check/ }))?.text).toBe(shown)
     await ui.unmount()
   }
 })
 
-test('a check runs every 60th second, never sooner', async ($, on) => {
+test('a burst of events makes one check, two seconds after the last', async ($, on) => {
   const clock = mock.clock(on)
-  const messages: SessionMessage[] = [{ role: 'user', text: 'one', toolUses: [] }]
-  let calls = 0
-  engine(on, messages, () => {
-    calls += 1
+  const messages: SessionMessage[] = []
+  let reads = 0
+  const read = async () => {
+    reads += 1
 
-    return { value: { isAnswered: true, text: 'A recap.', usage: USAGE } }
+    return [...messages]
+  }
+  engine(on, read, () => say('Now: Working.'))
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  // The start's own check, for a transcript the session resumed.
+  await clock.advance(2_000)
+  expect(reads).toBe(1)
+
+  for (let n = 0; n < 4; n++) {
+    messages.push(did(READ))
+    await $.tool.call({ tool: 'Read', file_path: '/r/README.md' })
+    await clock.advance(1_500)
+  }
+  expect(reads).toBe(1)
+  await clock.advance(500)
+  expect(reads).toBe(2)
+  // No event, no check.
+  await clock.advance(60_000)
+  expect(reads).toBe(2)
+})
+
+test("Haiku recaps at the end of the session's turn and at every fifth call, never at each call", async ($, on) => {
+  const clock = mock.clock(on)
+  const messages: SessionMessage[] = []
+  let asked = 0
+  engine(on, messages, () => {
+    asked += 1
+
+    return say('Now: Working.')
   })
 
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await clock.advance(59_000)
-  expect(calls).toBe(0)
-  await clock.advance(1_000)
-  expect(calls).toBe(1)
+  await clock.advance(2_000)
+  // An empty transcript asks nothing.
+  expect(asked).toBe(0)
+
+  const edit = async () => {
+    messages.push(did(EDIT))
+    await $.tool.call({ tool: 'Edit', file_path: '/r/a.ts', old_string: 'a', new_string: 'b' })
+    await clock.advance(2_000)
+  }
+  for (let n = 0; n < 4; n++) await edit()
+  expect(asked).toBe(0)
+  await edit()
+  expect(asked).toBe(1)
+  // The count starts over at each recap.
+  await clock.advance(10_000)
+  for (let n = 0; n < 4; n++) await edit()
+  expect(asked).toBe(1)
+
+  messages.push({ role: 'assistant', text: 'Done.', toolUses: [] })
+  await $.turn.complete(END)
+  await clock.advance(2_000)
+  expect(asked).toBe(2)
+
+  // A helper's turn changes no recap.
+  messages.push({ role: 'assistant', text: 'A helper reported.', toolUses: [] })
+  await $.turn.start({ text: 'look', turnId: 'h1', agentId: 'a1' })
+  await $.turn.complete({ ...END, turnId: 'h1', agentId: 'a1' })
+  await clock.advance(30_000)
+  expect(asked).toBe(2)
+})
+
+test('a recap due within ten seconds of the last waits for the gap, then reads the newest activity', async ($, on) => {
+  const clock = mock.clock(on)
+  const messages: SessionMessage[] = [{ role: 'user', text: 'one', toolUses: [] }]
+  const prompts: string[] = []
+  engine(on, messages, e => {
+    prompts.push(e.prompt)
+
+    return say('Now: Working.')
+  })
+
+  // A resumed transcript is recapped at the start's own check, two seconds in.
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await clock.advance(2_000)
+  expect(prompts.length).toBe(1)
 
   messages.push({ role: 'assistant', text: 'two', toolUses: [] })
-  await clock.advance(59_000)
-  expect(calls).toBe(1)
-  await clock.advance(1_000)
-  expect(calls).toBe(2)
+  await $.turn.complete(END)
+  await clock.advance(7_000)
+  messages.push({ role: 'assistant', text: 'three', toolUses: [] })
+  await clock.advance(2_900)
+  expect(prompts.length).toBe(1)
+  await clock.advance(100)
+  expect(prompts.length).toBe(2)
+  expect(prompts[1]).toContain('assistant: three')
+})
 
+test('an event while a check runs gets one more check once that one is done', async ($, on) => {
+  const clock = mock.clock(on)
+  const messages: SessionMessage[] = [did(READ)]
+  // The transcript as it read when asked, handed back a while later.
+  const read = async () => {
+    const rows = [...messages]
+    await clock.sleep(3_000)
+
+    return rows
+  }
+  engine(on, read, () => say('Now: Working.'))
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect((await ui.find({ type: 'Text', text: /A recap/ }))?.text).toBe('A recap.')
+  const shown = async () => (await ui.findAll({ type: 'Text' }))[0]?.text
+
+  // The start's check reads from two seconds in to five; an edit lands meanwhile, its check due at four and a half.
+  await clock.advance(2_500)
+  messages.push(did(EDIT))
+  await $.tool.call({ tool: 'Edit', file_path: '/r/a.ts', old_string: 'a', new_string: 'b' })
+  await clock.advance(2_500)
+  expect(await shown()).toBe('RESEARCHING')
+  await clock.advance(3_000)
+  expect(await shown()).toBe('CODING')
+  await ui.unmount()
+  // Every read and reply still asleep runs out before the test ends.
+  await clock.advance(60_000)
+})
+
+test('a turn that ends while a check reads an older transcript still gets its recap', async ($, on) => {
+  const clock = mock.clock(on)
+  const messages: SessionMessage[] = [{ role: 'user', text: 'one', toolUses: [] }]
+  const read = async () => {
+    const rows = [...messages]
+    await clock.sleep(3_000)
+
+    return rows
+  }
+  const prompts: string[] = []
+  engine(on, read, e => {
+    prompts.push(e.prompt)
+
+    return say('Now: Working.')
+  })
+
+  // The start's check reads from two seconds in to five; the turn ends meanwhile.
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await clock.advance(2_500)
+  messages.push({ role: 'assistant', text: 'the final answer', toolUses: [] })
+  await $.turn.complete(END)
+  await clock.advance(30_000)
+
+  // The first recap read the older transcript; the turn's own came after it, past the gap.
+  expect(prompts.length).toBe(2)
+  expect(prompts[0]).not.toContain('the final answer')
+  expect(prompts[1]).toContain('assistant: the final answer')
+})
+
+test('a /resume recaps the transcript it brings once the engine swaps it in, never the one it left', async ($, on) => {
+  const clock = mock.clock(on)
+  const messages: SessionMessage[] = [did(sh('git push')), { role: 'user', text: 'old work', toolUses: [] }]
+  const prompts: string[] = []
+  engine(on, messages, e => {
+    prompts.push(e.prompt)
+
+    return say('Now: Working.')
+  })
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await clock.advance(2_000)
+  expect(prompts.length).toBe(1)
+  // The end returns before the engine swaps in the resumed transcript: the checks meanwhile read the old one.
+  await $.session.end({ ...CLEAR, reason: 'resume' })
+  await clock.advance(5_000)
+  expect(prompts.length).toBe(1)
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['Waiting for activity.'])
+
+  // The engine's SessionStart says the resumed transcript is in.
+  messages.splice(0, messages.length, did(EDIT), { role: 'user', text: 'the resumed work', toolUses: [] })
+  await $.classic.SessionStart({ source: 'resume' })
+  await clock.advance(10_000)
+  expect(prompts.length).toBe(2)
+  expect(prompts[1]).toContain('user: the resumed work')
+  expect((await ui.findAll({ type: 'Text' }))[0]?.text).toBe('CODING')
   await ui.unmount()
 })
 
-test('/recap-box update sets the seconds between checks, and later sessions keep them', async ($, on) => {
+test('a /resume whose transcript lands late is recapped by the retries alone', async ($, on) => {
   const clock = mock.clock(on)
-  const store = new Map<string, unknown>()
-  const messages: SessionMessage[] = [{ role: 'user', text: 'one', toolUses: [] }]
+  const messages: SessionMessage[] = [{ role: 'user', text: 'old work', toolUses: [] }]
   const prompts: string[] = []
-  let calls = 0
+  engine(on, messages, e => {
+    prompts.push(e.prompt)
+
+    return say('Now: Working.')
+  })
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await clock.advance(2_000)
+  await $.session.end({ ...CLEAR, reason: 'resume' })
+  await clock.advance(7_000)
+  messages.splice(0, messages.length, { role: 'user', text: 'the resumed work', toolUses: [] })
+  await clock.advance(10_000)
+
+  expect(prompts.length).toBe(2)
+  expect(prompts[1]).toContain('user: the resumed work')
+  // The retries stop: with nothing new, nothing more reads.
+  await clock.advance(60_000)
+  expect(prompts.length).toBe(2)
+})
+
+test("a /resume that lands after the retries is recapped at the engine's SessionStart", async ($, on) => {
+  const clock = mock.clock(on)
+  const messages: SessionMessage[] = [{ role: 'user', text: 'old work', toolUses: [] }]
+  const prompts: string[] = []
+  engine(on, messages, e => {
+    prompts.push(e.prompt)
+
+    return say('Now: Working.')
+  })
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await clock.advance(2_000)
+  await $.session.end({ ...CLEAR, reason: 'resume' })
+  await clock.advance(30_000)
+  messages.splice(0, messages.length, { role: 'user', text: 'the resumed work', toolUses: [] })
+  await $.classic.SessionStart({ source: 'resume' })
+  await clock.advance(15_000)
+
+  expect(prompts.at(-1)).toContain('user: the resumed work')
+})
+
+test('a /clear, an exit or a logout schedules no check', async ($, on) => {
+  const clock = mock.clock(on)
+  let reads = 0
+  const read = async () => {
+    reads += 1
+
+    return [did(EDIT)]
+  }
+  engine(on, read, () => say('Now: Working.'))
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await clock.advance(2_000)
+  for (const reason of ['clear', 'prompt_input_exit', 'logout', 'other'] as const) {
+    const before = reads
+    await $.session.end({ ...CLEAR, reason })
+    await clock.advance(30_000)
+    expect({ reason, reads: reads - before }).toEqual({ reason, reads: 0 })
+  }
+})
+
+test('calls made while a check reads still count toward the next recap', async ($, on) => {
+  const clock = mock.clock(on)
+  const messages: SessionMessage[] = []
+  const read = async () => {
+    const rows = [...messages]
+    await clock.sleep(3_000)
+
+    return rows
+  }
+  let asked = 0
+  engine(on, read, () => {
+    asked += 1
+
+    return say('Now: Working.')
+  })
+  const edit = async () => {
+    messages.push(did(EDIT))
+    await $.tool.call({ tool: 'Edit', file_path: '/r/a.ts', old_string: 'a', new_string: 'b' })
+  }
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await clock.advance(5_000)
+  // A turn ends; its check reads from two seconds on to five, and three calls land meanwhile.
+  messages.push({ role: 'assistant', text: 'Done.', toolUses: [] })
+  await $.turn.complete(END)
+  await clock.advance(2_500)
+  for (let n = 0; n < 3; n++) await edit()
+  await clock.advance(20_000)
+  expect(asked).toBe(1)
+  // Two more make five since that recap read.
+  await edit()
+  await edit()
+  await clock.advance(20_000)
+  expect(asked).toBe(2)
+})
+
+test('a steady stream of calls still gets its checks', async ($, on) => {
+  const clock = mock.clock(on)
+  let reads = 0
+  const read = async () => {
+    reads += 1
+
+    return [did(READ)]
+  }
+  engine(on, read, () => say('Now: Working.'))
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await clock.advance(2_000)
+  const before = reads
+  // A helper's start every second and a half, each sooner than the two seconds a check waits.
+  for (let n = 0; n < 20; n++) {
+    await $.turn.start({ text: 'look', turnId: `h${n}`, agentId: 'a1' })
+    await clock.advance(1_500)
+  }
+  // Put off five times at most, a check runs about every ten seconds of the stream.
+  expect(reads - before).toBe(2)
+  await clock.advance(60_000)
+})
+
+test('a box drawn at last checks the recap that came due while it waited', async ($, on) => {
+  const clock = mock.clock(on)
+  let isPlaced = false
+  let asked = 0
   engine(
     on,
-    messages,
-    e => {
-      calls += 1
-      prompts.push(e.prompt)
+    [{ role: 'user', text: 'resume the work', toolUses: [] }],
+    () => {
+      asked += 1
 
-      return say('Now: Working.')
+      return say('Now: Picking the work back up.')
     },
-    { store },
+    { isPlaced: () => isPlaced },
   )
+
+  // Opened unasked on a narrow terminal, the box waits undrawn.
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await clock.advance(30_000)
+  expect(asked).toBe(0)
+  // The terminal is widened: the box is drawn, with no new activity.
+  isPlaced = true
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await clock.advance(2_000)
+  expect(asked).toBe(1)
+  expect((await ui.find({ type: 'Text', text: /Picking/ }))?.text).toBe('Picking the work back up.')
+  // Its own writes draw it again, and schedule nothing more.
+  await clock.advance(60_000)
+  expect(asked).toBe(1)
+  await ui.unmount()
+})
+
+test("a call during a check that must wait out the gap keeps its own check, not the gap's", async ($, on) => {
+  const clock = mock.clock(on)
+  const messages: SessionMessage[] = [did(EDIT), { role: 'user', text: 'one', toolUses: [] }]
+  const read = async () => {
+    const rows = [...messages]
+    await clock.sleep(1_000)
+
+    return rows
+  }
+  engine(on, read, () => say('Now: Working.'))
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const shown = async () => (await ui.findAll({ type: 'Text' }))[0]?.text
+  // The start's recap is asked at three; a turn ends then, and its check reads from five to six.
+  await clock.advance(3_000)
+  messages.push({ role: 'assistant', text: 'two', toolUses: [] })
+  await $.turn.complete(END)
+  await clock.advance(2_500)
+  // A push lands while it reads: its own check is due at seven and a half, the gap's at thirteen.
+  messages.push(did(sh('git push')))
+  await $.tool.call({ tool: 'Bash', command: 'git push' })
+  await clock.advance(3_000)
+  expect(await shown()).toBe('SHIPPING')
+  await clock.advance(60_000)
+  await ui.unmount()
+})
+
+test('a drawn box waiting out the gap reads the transcript only when it must', async ($, on) => {
+  const clock = mock.clock(on)
+  const messages: SessionMessage[] = [did(EDIT), { role: 'user', text: 'one', toolUses: [] }]
+  let reads = 0
+  const read = async () => {
+    reads += 1
+
+    return [...messages]
+  }
+  engine(on, read, () => say('Now: Working.'))
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await clock.advance(2_000)
+  // A turn ends right after a recap: its check at four waits for twelve, and each check's write draws the box again.
+  messages.push({ role: 'assistant', text: 'two', toolUses: [] })
+  await $.turn.complete(END)
+  await clock.advance(10_000)
+  expect(reads).toBe(3)
+  await clock.advance(60_000)
+  expect(reads).toBe(3)
+  await ui.unmount()
+})
+
+test("a helper's calls ask for no recap, even while the session's own are due one", async ($, on) => {
+  const clock = mock.clock(on)
+  const messages: SessionMessage[] = []
+  const read = async () => {
+    const rows = [...messages]
+    await clock.sleep(3_000)
+
+    return rows
+  }
+  let asked = 0
+  engine(on, read, () => {
+    asked += 1
+
+    return say('Now: Working.')
+  })
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await clock.advance(5_000)
+  // Five of the session's own calls ask for a recap; its check reads from two seconds on to five.
+  for (let n = 0; n < 5; n++) {
+    messages.push(did(EDIT))
+    await $.tool.call({ tool: 'Edit', file_path: '/r/a.ts', old_string: 'a', new_string: 'b' })
+  }
+  await clock.advance(2_500)
+  // A helper's calls land while it reads.
+  for (let n = 0; n < 3; n++) {
+    messages.push(did(READ))
+    await $.tool.call({ tool: 'Read', file_path: '/r/README.md', agentId: 'a1' } as Parameters<Engine['tool']['call']>[0])
+  }
+  await clock.advance(60_000)
+  expect(asked).toBe(1)
+})
+
+test("a /clear drops the old conversation's pending check: nothing reads it while the end runs", async ($, on) => {
+  const clock = mock.clock(on)
+  let reads = 0
+  const read = async () => {
+    reads += 1
+
+    return [did(EDIT)]
+  }
+  const end = () => clock.sleep(5_000)
+  engine(on, read, () => say('Now: Working.'), { end })
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await clock.advance(2_000)
+  const before = reads
+  // A call puts a check two seconds off; the /clear starts before then and takes five.
+  await $.tool.call({ tool: 'Read', file_path: '/r/README.md' })
+  const ending = $.session.end(CLEAR)
+  await clock.advance(4_000)
+  expect(reads).toBe(before)
+  await clock.advance(1_000)
+  await ending
+  // Every read and reply still asleep runs out before the test ends.
+  await clock.advance(60_000)
+})
+
+test('/recap-box opens the box and checks it; with words it says what it does', async ($, on) => {
+  const clock = mock.clock(on)
+  const messages: SessionMessage[] = [{ role: 'user', text: 'one', toolUses: [] }]
+  const prompts: string[] = []
+  engine(on, messages, e => {
+    prompts.push(e.prompt)
+
+    return say('Now: Working.')
+  })
   const run = async (args: string) =>
     (await $.command.run({ command: 'recap-box', args, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })).text
 
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await clock.advance(2_000)
+  expect(prompts.length).toBe(1)
+
+  // Opened, the box reads the stage again; with no turn over, it asks for no recap.
+  messages.push(did(EDIT))
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  const countdown = async () => (await ui.find({ type: 'Text', text: /next check/ }))?.text
-
-  // Mid-count, the count starts over at the new length.
-  await clock.advance(5_000)
-  expect(await run('update 20')).toBe('The box checks every 20s.')
-  expect(await countdown()).toBe('next check in 20s')
-  await clock.advance(19_000)
-  expect(calls).toBe(0)
-  await clock.advance(1_000)
-  expect(calls).toBe(1)
-  expect(await countdown()).toBe('next check in 20s')
-
-  // Out of range or no number changes nothing.
-  for (const args of ['update 9', 'update 3601', 'update soon', 'update', 'faster', 'please update 30']) {
-    expect(await run(args)).toBe(
-      '/recap-box opens the box; /recap-box update <seconds>, from 10 to 3600, sets the time between checks. The box checks every 20s.',
-    )
-  }
-  expect(await run(' UPDATE 3600s ')).toBe('The box checks every 3600s.')
-  expect(await run('update 10')).toBe('The box checks every 10s.')
-  expect(store.get('every')).toBe(10)
   expect(await run('')).toBe('Recap box opened.')
+  await clock.advance(2_000)
+  expect((await ui.findAll({ type: 'Text' }))[0]?.text).toBe('CODING')
+  expect(prompts.length).toBe(1)
   await ui.unmount()
+
+  for (const args of ['update 30', 'faster', ' please ']) {
+    expect(await run(args)).toBe('/recap-box opens the box. It updates as the session works.')
+  }
 
   // The box's own command asks for nothing: it is no part of the goal.
   await $.prompt.submit({ text: '/recap-box update 30', wait: false, origin: { kind: 'composer' }, command: { name: 'recap-box', args: 'update 30' } })
   await $.prompt.submit({ text: 'fix the login page', wait: false, origin: { kind: 'composer' } })
   messages.push({ role: 'user', text: 'two', toolUses: [] })
-  await clock.advance(10_000)
-  expect(calls).toBe(2)
+  await ends($, clock)
+  expect(prompts.length).toBe(2)
   expect(prompts.at(-1)?.match(/^- .*$/gm)).toEqual(['- fix the login page'])
-})
-
-test('a session starts at the kept length, or at 60s when the kept value is unusable', async ($, on) => {
-  const clock = mock.clock(on)
-  let calls = 0
-  engine(
-    on,
-    [{ role: 'user', text: 'one', toolUses: [] }],
-    () => {
-      calls += 1
-
-      return say('Now: Working.')
-    },
-    { store: new Map<string, unknown>([['every', 10]]) },
-  )
-
-  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect((await ui.find({ type: 'Text', text: /next check/ }))?.text).toBe('next check in 10s')
-  await clock.advance(9_000)
-  expect(calls).toBe(0)
-  await clock.advance(1_000)
-  expect(calls).toBe(1)
-  await ui.unmount()
-})
-
-for (const kept of [-1, 0.5, 30.5, true, 5, 3601, 1e9, 'soon']) {
-  test(`a kept value of ${JSON.stringify(kept)} starts the box at 60s`, async ($, on) => {
-    const clock = mock.clock(on)
-    engine(on, [], () => say('Now: Working.'), { store: new Map<string, unknown>([['every', kept]]) })
-
-    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-    await clock.advance(1_000)
-    expect((await ui.find({ type: 'Text', text: /next check/ }))?.text).toBe('next check in 59s')
-    await ui.unmount()
-  })
-}
-
-test('a store that cannot be read or written leaves the box at work', async ($, on) => {
-  const clock = mock.clock(on)
-  let calls = 0
-  const broken: Store = {
-    get: () => {
-      throw new Error('the store file is not JSON')
-    },
-    set: () => {
-      throw new Error('the disk is full')
-    },
-  }
-  engine(
-    on,
-    [{ role: 'user', text: 'one', toolUses: [] }],
-    () => {
-      calls += 1
-
-      return say('Now: Working.')
-    },
-    { store: broken },
-  )
-
-  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  await clock.advance(60_000)
-  expect(calls).toBe(1)
-  // A save that fails changes nothing, not even for this session.
-  const ran = $.command.run({ command: 'recap-box', args: 'update 20', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
-  expect(await ran.then(() => 'saved', () => 'refused')).toBe('refused')
-  await clock.advance(20_000)
-  expect((await ui.find({ type: 'Text', text: /next check/ }))?.text).toBe('next check in 40s')
-  await clock.advance(40_000)
-  expect((await ui.find({ type: 'Text', text: /next check/ }))?.text).toBe('next check in 60s')
-  await ui.unmount()
 })
 
 test('a refused model call says so in the box', async ($, on) => {
@@ -289,24 +633,40 @@ test('a refused model call says so in the box', async ($, on) => {
   engine(on, [{ role: 'user', text: 'hi', toolUses: [] }], () => ({ deny: 'model blocked' }))
 
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await clock.advance(60_000)
+  await ends($, clock)
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /No recap/ }))?.text).toContain('model blocked')
   await ui.unmount()
 })
 
-test('a start without a surface counts down once the desktop app attaches', async ($, on) => {
+test('a start without a surface recaps once the desktop app attaches', async ($, on) => {
   const clock = mock.clock(on)
-  engine(on, [], () => ({ deny: 'nothing to recap' }))
+  let isPlaced = false
+  let asked = 0
+  engine(
+    on,
+    [{ role: 'user', text: 'resume the work', toolUses: [] }],
+    () => {
+      asked += 1
+
+      return say('Now: Picking the work back up.')
+    },
+    { isPlaced: () => isPlaced },
+  )
 
   // The desktop app, VS Code and mobile start this way, then attach.
   await $.session.start({ cwd: '/', surface: null, isInteractive: false })
+  await clock.advance(2_000)
+  // Nothing draws the box yet: the recap stays due.
+  expect(asked).toBe(0)
+  isPlaced = true
   await $.session.attach({ surface: 'desktop', clientId: 'd1' })
+  await clock.advance(2_000)
+  expect(asked).toBe(1)
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  await clock.advance(15_000)
-  expect((await ui.find({ type: 'Text', text: /next check/ }))?.text).toBe('next check in 45s')
+  expect((await ui.find({ type: 'Text', text: /Picking/ }))?.text).toBe('Picking the work back up.')
   await ui.unmount()
 })
 
@@ -322,21 +682,21 @@ test("a /clear drops the stage, the goal and the person's asks with the recap", 
 
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   await $.prompt.submit({ text: 'build a recap box', wait: false, origin: { kind: 'composer' } })
-  await clock.advance(60_000)
+  await ends($, clock)
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   const shown = async () => (await ui.findAll({ type: 'Text' })).map(t => t.text)
-  expect(await shown()).toEqual(['CODING', 'Building it.', 'GOAL', 'A recap box.', 'next check in 60s'])
+  expect(await shown()).toEqual(['CODING', 'Building it.', 'GOAL', 'A recap box.'])
   messages.length = 0
   await $.session.end(CLEAR)
-  expect(await shown()).toEqual(['Waiting for activity.', 'next check in 60s'])
+  expect(await shown()).toEqual(['Waiting for activity.'])
   await ui.unmount()
 
-  // The next conversation's first check knows none of the old one's asks.
+  // The next conversation's first recap knows none of the old one's asks.
   messages.push({ role: 'user', text: 'two', toolUses: [] })
-  await clock.advance(60_000)
-  expect(prompts[0]).toContain('oldest first:\n- build a recap box\n')
-  expect(prompts[1]).toContain('oldest first:\nnone\n')
+  await ends($, clock)
+  expect(prompts.at(-2)).toContain('oldest first:\n- build a recap box\n')
+  expect(prompts.at(-1)).toContain('oldest first:\nnone\n')
 })
 
 test('a /clear during a check keeps the old stage out of the new conversation', async ($, on) => {
@@ -349,10 +709,10 @@ test('a /clear during a check keeps the old stage out of the new conversation', 
   })
 
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await clock.advance(60_000)
+  await clock.advance(2_000)
   // The stage shows while the recap is still being written, with no placeholder under it.
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['CODING', 'next check in 60s'])
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['CODING'])
   messages.length = 0
   await $.session.end(CLEAR)
   await clock.advance(20_000)
@@ -360,6 +720,8 @@ test('a /clear during a check keeps the old stage out of the new conversation', 
   expect(await ui.find({ type: 'Text', text: /CODING|GOAL|Old aim/ })).toBeUndefined()
   expect((await ui.find({ type: 'Text', text: /Waiting/ }))?.text).toBe('Waiting for activity.')
   await ui.unmount()
+  // Every read and reply still asleep runs out before the test ends.
+  await clock.advance(60_000)
 })
 
 test('a check that starts while a /clear ends the conversation keeps the old one out', async ($, on) => {
@@ -367,7 +729,7 @@ test('a check that starts while a /clear ends the conversation keeps the old one
   const messages: SessionMessage[] = [did(sh('git push'))]
   // The engine's end takes a moment, and until it is done messages() reads the old conversation.
   const end = async () => {
-    await clock.sleep(1_500)
+    await clock.sleep(3_000)
     messages.length = 0
   }
   // Its recap lands after the end is done.
@@ -380,14 +742,18 @@ test('a check that starts while a /clear ends the conversation keeps the old one
 
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  await clock.advance(59_500)
   const ending = $.session.end(CLEAR)
-  await clock.advance(1_500)
-  await ending
-  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['Waiting for activity.', 'next check in 59s'])
+  await clock.settle()
+  // A turn ends while the end runs: its check, two seconds on, reads the old conversation.
+  await $.turn.complete(END)
   await clock.advance(3_000)
-  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['Waiting for activity.', 'next check in 56s'])
+  await ending
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['Waiting for activity.'])
+  await clock.advance(3_000)
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['Waiting for activity.'])
   await ui.unmount()
+  // Every read and reply still asleep runs out before the test ends.
+  await clock.advance(60_000)
 })
 
 test('a /clear while a check reads the transcript keeps the old stage out', async ($, on) => {
@@ -401,12 +767,14 @@ test('a /clear while a check reads the transcript keeps the old stage out', asyn
 
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  await clock.advance(60_000)
+  await clock.advance(2_000)
   await $.session.end(CLEAR)
   await clock.advance(5_000)
 
-  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['Waiting for activity.', 'next check in 55s'])
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['Waiting for activity.'])
   await ui.unmount()
+  // Every read and reply still asleep runs out before the test ends.
+  await clock.advance(60_000)
 })
 
 test('each kind of tool call names its stage', async ($, on) => {
@@ -463,7 +831,7 @@ test('each kind of tool call names its stage', async ($, on) => {
   for (const [call, stage] of cases) {
     await $.session.end(CLEAR)
     messages.splice(0, messages.length, did(call))
-    await clock.advance(60_000)
+    await ends($, clock)
     expect({ call: call.input, shown: (await ui.findAll({ type: 'Text' }))[0]?.text }).toEqual({ call: call.input, shown: stage })
   }
   await ui.unmount()
@@ -478,18 +846,18 @@ test('the stage is the newest of the last five calls that does more than look', 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   const shown = async () => (await ui.findAll({ type: 'Text' }))[0]?.text
 
-  await clock.advance(60_000)
+  await clock.advance(2_000)
   expect(await shown()).toBe('SHIPPING')
   // A call no rule names casts no vote.
   messages.push(did(use('ToolSearch', { query: 'x' }), use('SendMessage', { to: 'a', message: 'm' }), use('mcp__db__query', { sql: 's' })))
-  await clock.advance(60_000)
+  await calls($, clock)
   expect(await shown()).toBe('SHIPPING')
   // The commit is the fifth call back, then the sixth.
   messages.push(did(READ))
-  await clock.advance(60_000)
+  await calls($, clock)
   expect(await shown()).toBe('SHIPPING')
   messages.push(did(READ))
-  await clock.advance(60_000)
+  await calls($, clock)
   expect(await shown()).toBe('RESEARCHING')
   await ui.unmount()
 })
@@ -504,16 +872,16 @@ test('a failed test run reads as debugging while it is among the last five calls
   const shown = async () => (await ui.findAll({ type: 'Text' }))[0]?.text
   const after = async (...toolUses: ToolUseSummary[]) => {
     messages.push(did(...toolUses))
-    await clock.advance(60_000)
+    await calls($, clock)
 
     return shown()
   }
 
-  // A run still going is testing; its failure shows at the next check, though the transcript reads the same.
-  await clock.advance(60_000)
+  // A run still going is testing; its failure shows at the call's own check, though the transcript reads the same.
+  await clock.advance(2_000)
   expect(await shown()).toBe('TESTING')
   messages[0] = did(EDIT, sh('npm test', true))
-  await clock.advance(60_000)
+  await calls($, clock)
   expect(await shown()).toBe('DEBUGGING')
   // Looking and fixing after it is still debugging; a run that passes ends it.
   expect(await after(READ, EDIT, EDIT)).toBe('DEBUGGING')
@@ -538,11 +906,27 @@ test('a helper agent at work shows while the session waits on it or only looks',
   const clock = mock.clock(on)
   const messages: SessionMessage[] = [did(EDIT, READ), { role: 'assistant', text: 'Waiting on the review.', toolUses: [] }]
   const agents: AgentInfo[] = []
-  engine(on, messages, () => say('Now: Working.'), { agents })
+  let asked = 0
+  engine(
+    on,
+    messages,
+    () => {
+      asked += 1
+
+      return say('Now: Working.')
+    },
+    { agents },
+  )
 
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   const shown = async () => (await ui.findAll({ type: 'Text' }))[0]?.text
+  // A helper's turn starting or ending: the stage is read again, and no recap is asked for.
+  const helper = async (event: 'start' | 'complete', agentId: string) => {
+    if (event === 'start') await $.turn.start({ text: 'look', turnId: `h-${agentId}`, agentId })
+    else await $.turn.complete({ ...END, turnId: `h-${agentId}`, agentId })
+    await clock.advance(2_000)
+  }
   // Named by its kind: its task's words name no stage.
   const reviewer: AgentInfo = { id: 'a1', description: 'Second look at the diff', type: 'oh-my-claudecode:code-reviewer', status: 'running' }
 
@@ -554,37 +938,40 @@ test('a helper agent at work shows while the session waits on it or only looks',
     { ...reviewer, id: 'a5', status: 'pending' },
     { ...reviewer, id: 'w@team', teammateId: 'w@team' },
   )
-  await clock.advance(60_000)
+  await clock.advance(2_000)
   expect(await shown()).toBe('CODING')
-  // It shows from the check after it starts, though the transcript reads the same.
+  // The start's own check recapped the resumed transcript; from here on, helpers ask for none.
+  expect(asked).toBe(1)
+  // It shows from its start, though the transcript reads the same.
   agents.push(reviewer)
-  await clock.advance(60_000)
+  await helper('start', 'a1')
   expect(await shown()).toBe('REVIEWING')
   // Waiting on its own run, it is still at work.
   agents.splice(-1, 1, { ...reviewer, status: 'waiting' })
-  await clock.advance(60_000)
+  await helper('complete', 'a1')
   expect(await shown()).toBe('REVIEWING')
   agents.splice(-1, 1, reviewer)
   // Back at work, the session's own calls show, and still once a call's result is the newest row.
   const look = use('Read', { file_path: '/r/README.md' })
   messages.push(did(look))
-  await clock.advance(60_000)
+  await calls($, clock)
   expect(await shown()).toBe('CODING')
   messages.push({ role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: look.tool_use_id, text: 'one line', isError: false }] })
-  await clock.advance(60_000)
+  await calls($, clock)
   expect(await shown()).toBe('CODING')
   // Once the last five calls only look, the helper's again.
   messages.push(did(READ, READ, READ, READ))
-  await clock.advance(60_000)
+  await calls($, clock)
   expect(await shown()).toBe('REVIEWING')
   // A helper that is done shows no more.
   agents.splice(0, agents.length, { ...reviewer, status: 'completed' })
-  await clock.advance(60_000)
+  await helper('complete', 'a1')
   expect(await shown()).toBe('RESEARCHING')
   // A helper of no named kind goes by its task.
   agents.push({ id: 'a4', description: 'Plan the release', type: 'general-purpose', status: 'running' })
-  await clock.advance(60_000)
+  await helper('start', 'a4')
   expect(await shown()).toBe('PLANNING')
+  expect(asked).toBe(1)
   await ui.unmount()
 })
 
@@ -593,7 +980,7 @@ test('the goal sits pinned under what is happening now, on every surface', async
   engine(on, [did(EDIT)], () => say('**Now:** Adding a second summary.\n**Goal:** Make the box easy to read.'))
 
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await clock.advance(60_000)
+  await ends($, clock)
 
   for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
@@ -602,7 +989,6 @@ test('the goal sits pinned under what is happening now, on every surface', async
       'Adding a second summary.',
       'GOAL',
       'Make the box easy to read.',
-      'next check in 60s',
     ])
     expect((await ui.find({ type: 'Text', text: 'GOAL' }))?.props.bold).toBe(true)
     // Every color a theme key, so the box follows the person's theme.
@@ -611,7 +997,6 @@ test('the goal sits pinned under what is happening now, on every surface', async
       'text',
       'claude',
       'text',
-      'subtle',
     ])
     await ui.unmount()
   }
@@ -645,30 +1030,31 @@ test('the goal holds until a reply names a new one', async ($, on) => {
 
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  // The recap, the goal's label and the goal, over the countdown.
-  const shown = async () => (await ui.findAll({ type: 'Text' })).map(t => t.text).slice(0, 3)
+  // The recap, the goal's label and the goal.
+  const shown = async () => (await ui.findAll({ type: 'Text' })).map(t => t.text)
 
-  await clock.advance(60_000)
+  await ends($, clock)
   expect(await shown()).toEqual(['Working out the plan.', 'GOAL', 'Build a recap box.'])
   const nows = ['Writing the box.', 'Checking that the box works.', 'Checking it again.', 'Fixing a slip.', 'Nearly done.', 'Tidying up.', 'Wrapping up.', 'Looking it over.', 'Reading it again.', 'Last touches.']
   for (const now of nows) {
     messages.push({ role: 'assistant', text: String(messages.length), toolUses: [] })
-    await clock.advance(60_000)
+    await ends($, clock)
     expect(await shown()).toEqual([now, 'GOAL', 'Build a recap box.'])
   }
   messages.push({ role: 'user', text: 'now share it', toolUses: [] })
-  await clock.advance(60_000)
+  await ends($, clock)
   expect(await shown()).toEqual(['Sharing it.', 'GOAL', 'Keep the same box.'])
   await ui.unmount()
 
-  // Each check is shown the goal it may keep.
+  // Each recap is shown the goal it may keep.
   expect(prompts.map(p => p.split('\n')[0])).toEqual(['Goal so far: none', ...Array(11).fill('Goal so far: Build a recap box.')])
 })
 
 test("the goal reads the person's own prompts, the first and the newest eight", async ($, on) => {
   const clock = mock.clock(on)
   const prompts: string[] = []
-  engine(on, [{ role: 'user', text: 'one', toolUses: [] }], e => {
+  const messages: SessionMessage[] = []
+  engine(on, messages, e => {
     prompts.push(e.prompt)
 
     return say('Now: Working.\nGoal: Answer the asks.')
@@ -689,7 +1075,8 @@ test("the goal reads the person's own prompts, the first and the newest eight", 
   await send('a task finished', { kind: 'task-notification' })
   await send('hello from a peer', { kind: 'peer' })
   await $.prompt.submit({ text: 'hidden', wait: false, origin: { kind: 'composer' }, isMeta: true })
-  await clock.advance(60_000)
+  messages.push({ role: 'user', text: 'one', toolUses: [] })
+  await ends($, clock)
 
   expect(prompts[0]?.match(/^- .*$/gm)).toEqual([
     '- ask 0',
@@ -702,7 +1089,8 @@ test("the goal reads the person's own prompts, the first and the newest eight", 
 test("an ask is what entered beneath, from the person's own origins alone", async ($, on) => {
   const clock = mock.clock(on)
   const prompts: string[] = []
-  const entered = engine(on, [{ role: 'user', text: 'one', toolUses: [] }], e => {
+  const messages: SessionMessage[] = []
+  const entered = engine(on, messages, e => {
     prompts.push(e.prompt)
 
     return say('Now: Working.')
@@ -726,7 +1114,8 @@ test("an ask is what entered beneath, from the person's own origins alone", asyn
   expect((await send('drop me', { kind: 'composer' })).drop).toBe('blocked')
   // Cut at 1200 through an emoji: the half left over is dropped, as the API refuses it.
   await send(`${'x'.repeat(1199)}😀 and more`, { kind: 'composer' })
-  await clock.advance(60_000)
+  messages.push({ role: 'user', text: 'one', toolUses: [] })
+  await ends($, clock)
 
   // Each prompt went on to the hooks beneath.
   expect(entered).toEqual(sent)

@@ -631,12 +631,15 @@ test('/recap-box hides the box, opens it and checks it; with words it says what 
   expect(await run('')).toBe('Recap box opened.')
   await clock.advance(2_000)
   expect((await ui.findAll({ type: 'Text' }))[0]?.text).toBe('CODING')
+  // Past the gap between recaps too, where a recap asked for would have been written.
+  await clock.advance(10_000)
   expect(prompts.length).toBe(1)
   // Turned on, the history opens the box the same way.
   messages.push(did(sh('npm test')))
   await run('history')
   await clock.advance(2_000)
   expect((await ui.findAll({ type: 'Text' }))[0]?.text).toBe('TESTING')
+  await clock.advance(10_000)
   expect(prompts.length).toBe(1)
   await ui.unmount()
 

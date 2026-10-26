@@ -379,6 +379,7 @@ export const register: Register = on => {
       if (!isShown) return { text: 'The box shows the latest recap only.' }
       await $.ui.open({ id: PANE, title: 'Recap', columns: 40 })
       top($)
+      poke($, false)
 
       return {
         text: 'The box lists its earlier recaps under the goal, the newest first. Scroll down in it for older ones, or press ctrl+x tab, then the down arrow, and Page Up to go back.',

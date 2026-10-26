@@ -537,6 +537,13 @@ export const register: Register = on => {
             <Text color="text">{aim}</Text>
           </Box>
         )}
+        {/* A faint dotted line across the box parts the recap and goal from the earlier recaps: in cells, so in the
+            monospaced face, and cut at the edge rather than wrapped where a face's glyph runs wider. */}
+        {past.length > 0 && (
+          <Text color="subtle" mono wrap="truncate">
+            {'┈'.repeat(e.props.bodyColumns)}
+          </Text>
+        )}
         {past.map(p => (
           <Box flexDirection="column">
             {p.stage && <Text color={STAGES[p.stage]}>{p.stage.toUpperCase()}</Text>}

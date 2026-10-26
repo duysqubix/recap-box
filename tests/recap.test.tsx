@@ -46,6 +46,8 @@ const did = (...toolUses: ToolUseSummary[]): SessionMessage => ({ role: 'assista
 const EDIT = use('Edit', { file_path: '/r/hooks/register.tsx' })
 const READ = use('Read', { file_path: '/r/hooks/register.tsx' })
 const sh = (command: string, isError?: true) => use('Bash', { command }, isError)
+// The dotted line over the earlier recaps, across the box's 40 columns.
+const DOTS = '┈'.repeat(40)
 
 // The session's turn ends, and the check after it has run, past the gap between recaps.
 const ends = async ($: Engine, clock: MockClock) => {
@@ -1235,6 +1237,7 @@ test('with history on, the earlier recaps run under the recap and goal, the newe
       'Checking the box.',
       'GOAL',
       'Add a history.',
+      DOTS,
       'CODING',
       'Changing the box.',
       'RESEARCHING',
@@ -1244,6 +1247,7 @@ test('with history on, the earlier recaps run under the recap and goal, the newe
     expect((await ui.find({ type: 'Text', text: 'CODING' }))?.props).toEqual({ color: 'claude' })
     expect((await ui.find({ type: 'Text', text: 'Changing the box.' }))?.props).toEqual({ color: 'inactive' })
     expect((await ui.find({ type: 'Text', text: 'TESTING' }))?.props).toMatchObject({ bold: true, color: 'autoAccept' })
+    expect((await ui.find({ type: 'Text', text: DOTS }))?.props).toEqual({ color: 'subtle', mono: true, wrap: 'truncate' })
     expect(await run(' HISTORY ')).toBe('The box shows the latest recap only.')
     expect(store.get('history')).toBe(false)
     expect(await shown()).toEqual(['TESTING', 'Checking the box.', 'GOAL', 'Add a history.'])
@@ -1264,7 +1268,7 @@ for (const [kept, isShown] of [[true, true], ['true', false], [1, false]] as con
     await ends($, clock)
     messages.push(did(EDIT))
     await ends($, clock)
-    expect(await shown()).toEqual(isShown ? ['CODING', 'Second.', 'RESEARCHING', 'First.'] : ['CODING', 'Second.'])
+    expect(await shown()).toEqual(isShown ? ['CODING', 'Second.', DOTS, 'RESEARCHING', 'First.'] : ['CODING', 'Second.'])
 
     // The next conversation's history starts with its own first recap.
     messages.splice(0, messages.length, did(sh('npm test')))
@@ -1299,22 +1303,22 @@ test("the history keeps the newest 200 recaps, and the person's place as the old
   for (let i = 0; i < 201; i++) await check()
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   isDrawn = true
-  // How many lines show, the first two and the last.
+  // How many lines show, the recap, the first earlier one under the dotted line, and the last.
   const seen = async () => {
     const shown = (await ui.findAll({ type: 'Text' })).map(t => t.text)
 
-    return [shown.length, shown[0], shown[1], shown.at(-1)]
+    return [shown.length, shown[0], shown[2], shown.at(-1)]
   }
-  expect(await seen()).toEqual([200, 'Recap 201.', 'Recap 200.', 'Recap 2.'])
+  expect(await seen()).toEqual([201, 'Recap 201.', 'Recap 200.', 'Recap 2.'])
 
   // A tick down passes Recap 200; the next recap drops Recap 2, and the box still starts from Recap 199.
   await $.ui.scroll({ component: 'Pane', requestId: 'recap', offset: 1, by: 1, bodyRows: 20, contentRows: 40, origin: { kind: 'person' }, pointer: { column: 5, row: 15 } })
   await check()
-  expect(await seen()).toEqual([198, 'Recap 202.', 'Recap 199.', 'Recap 3.'])
+  expect(await seen()).toEqual([199, 'Recap 202.', 'Recap 199.', 'Recap 3.'])
   // At the oldest, End's place, the next drop leaves the box on the new oldest.
   await $.ui.scroll({ component: 'Pane', requestId: 'recap', offset: 20, by: 40, bodyRows: 20, contentRows: 40, origin: { kind: 'person' } })
   await check()
-  expect(await seen()).toEqual([2, 'Recap 203.', 'Recap 4.', 'Recap 4.'])
+  expect(await seen()).toEqual([3, 'Recap 203.', 'Recap 4.', 'Recap 4.'])
   await ui.unmount()
 })
 
@@ -1353,7 +1357,7 @@ test('a scroll that reads the history while a /clear ends the conversation leave
 
   // The old conversation's place stays out: the box follows the new one's recaps from the newest.
   for (let i = 0; i < 8; i++) await check()
-  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual([13, 12, 11, 10, 9, 8, 7, 6].map(k => `Recap ${k}.`))
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['Recap 13.', DOTS, ...[12, 11, 10, 9, 8, 7, 6].map(k => `Recap ${k}.`)])
   await ui.unmount()
 })
 
@@ -1395,7 +1399,7 @@ test('the wheel and the keys move the earlier recaps under the recap and goal, a
   for (let i = 0; i < 4; i++) await check()
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   const shown = async (at = ui) => (await at.findAll({ type: 'Text' })).map(t => t.text)
-  const PINNED = ['GOAL', 'Read the box.']
+  const PINNED = ['GOAL', 'Read the box.', DOTS]
   const ALL = ['Recap 5.', ...PINNED, 'Recap 4.', 'Recap 3.', 'Recap 2.', 'Recap 1.']
 
   // With the history off, the engine moves the window as it came.
@@ -1463,8 +1467,9 @@ test('the wheel and the keys move the earlier recaps under the recap and goal, a
 
   // Inline above the prompt in the terminal, where the box is short, it shows them all and its window scrolls as it came.
   await ui.unmount()
-  const inline = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, placement: 'inline' } })
-  expect(await shown(inline)).toEqual(['Recap 8.', ...PINNED, 'Recap 7.', 'Recap 6.'])
+  const inline = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, placement: 'inline', bodyColumns: 96 } })
+  // The dotted line spans the box's own width.
+  expect(await shown(inline)).toEqual(['Recap 8.', 'GOAL', 'Read the box.', '┈'.repeat(96), 'Recap 7.', 'Recap 6.'])
   expect(await $.ui.scroll(tick)).toEqual({})
   expect(moves.at(-1)).toEqual(tick)
   await inline.unmount()
@@ -1482,9 +1487,9 @@ test('with history on, a refused model call shows in the recap\'s place and stay
   await ends($, clock)
   messages.push(did(EDIT))
   await ends($, clock)
-  expect(await shown()).toEqual(['CODING', expect.stringContaining('model blocked'), 'RESEARCHING', 'First.'])
+  expect(await shown()).toEqual(['CODING', expect.stringContaining('model blocked'), DOTS, 'RESEARCHING', 'First.'])
   messages.push(did(sh('npm test')))
   await ends($, clock)
-  expect(await shown()).toEqual(['TESTING', 'Third.', 'RESEARCHING', 'First.'])
+  expect(await shown()).toEqual(['TESTING', 'Third.', DOTS, 'RESEARCHING', 'First.'])
   await ui.unmount()
 })

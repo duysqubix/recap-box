@@ -17,6 +17,8 @@ A Claude Code mod: a small box beside the transcript that says, in plain words, 
 
 Later sessions keep the setting; sessions already open keep theirs until they restart.
 
+`/recap-box upgrade` installs the newest version and reloads the plugins. While one waits, the box says so at its top: see [Updates](#updates).
+
 ## Install
 
 At the prompt of a terminal session:
@@ -57,13 +59,15 @@ That entry, with `"recap-box@recap-box": true` under `enabledPlugins`, has two e
 
 Claude Code skips the check when its own auto-updater is off, as under `DISABLE_AUTOUPDATER` or `DISABLE_UPDATES`. Set `FORCE_AUTOUPDATE_PLUGINS=1` to keep the check on for plugins.
 
-To update right away:
+The box checks on its own, whatever those variables say. While `main` holds a commit the copy running lacks, it shows `Update available: /recap-box upgrade` at its top. It asks GitHub when a session starts at the prompt or a surface attaches, then every hour. A copy run from a clone (`--plugin-dir`) never shows it.
+
+To update right away, run `/recap-box upgrade`. It runs these two commands with the `claude` on your `PATH`, then reloads the plugins of that session:
 
 ```
 claude plugin marketplace update recap-box && claude plugin update recap-box@recap-box
 ```
 
-Then run `/reload-plugins` in any session that is already open.
+Where `claude` is not on the `PATH`, as in the desktop app, run them from a shell. Then run `/recap-box upgrade` or `/reload-plugins` in any other session that is already open.
 
 ## Develop
 

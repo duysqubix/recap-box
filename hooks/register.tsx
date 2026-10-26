@@ -13,9 +13,13 @@ const GAP_MS = 10_000
 const DELAYS = 5
 // A check that still reads the transcript a /resume left tries again this many times.
 const TRIES = 5
+// GitHub is asked this often whether main moved past the copy running, so a session left open hears of an update.
+const CHECK_MS = 3_600_000
 // Whether the box lists the recaps before the one on show, read from the store at each start.
 // Not in `$.state`: a /clear goes on under another session, whose values start over.
 let isHistoryShown = false
+// Whether main holds commits the copy running lacks, shown at the box's top; a module variable for the same reason.
+let isBehind = false
 const recap = atom({ plugin: 'recap-box', key: 'recap' } as const, null)
 // What the whole session works toward, pinned under the recap.
 const goal = atom({ plugin: 'recap-box', key: 'goal' } as const, null)
@@ -219,6 +223,19 @@ function top($: EngineInterface) {
   $.ui.scroll({ in: PANE, to: 'start' }).catch(() => undefined)
 }
 
+// An installed copy runs from a folder named for its commit, so GitHub can say whether main moved past it. A folder of
+// any other name (a clone given to --plugin-dir) is no commit there and, like a request that fails, shows nothing.
+async function check($: EngineInterface) {
+  const base = $.plugin.root.split(/[\\/]/).pop()
+  const is = await $.http
+    .fetch(`https://api.github.com/repos/duysqubix/recap-box/compare/${base}...main`, { headers: { 'User-Agent': 'recap-box' } })
+    .then(r => r.ok && JSON.parse(r.text).ahead_by > 0)
+    .catch(() => false)
+  if (is === isBehind) return
+  isBehind = is
+  $.ui.invalidate('ui.render')
+}
+
 // Puts a recap on show and adds it to the history, under the stage it was written in.
 async function say($: EngineInterface, at: number, text: string) {
   const name = await read($, stage)
@@ -344,8 +361,8 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'recap-box',
-      description: 'Show or hide the session recap box, or its history',
-      argumentHint: '[history]',
+      description: 'Show or hide the session recap box or its history, or upgrade it',
+      argumentHint: '[history|upgrade]',
     })
     // The store is a file anyone can edit: anything but true, or a value that cannot be read, leaves the history off.
     isHistoryShown = (await $.store.get('history').catch(() => undefined)) === true
@@ -356,14 +373,21 @@ export const register: Register = on => {
     if (isHistoryShown) top($)
     // A resumed session has a transcript already: recap it once the box is drawn.
     poke($, true)
+    // Main can move on while the session runs: asked every hour, past a /clear too, and at once where someone
+    // watches: a person at the prompt here, or a surface once it attaches. A -p run asks only after an hour.
+    // ponytail: each session asks on its own, and GitHub allows 60 unsigned asks an hour per address; share one
+    // answer through $.store if that runs short.
+    $.clock.every(CHECK_MS, () => void check($))
+    if (e.isInteractive) void check($)
 
     return next(e)
   })
 
-  // A surface that attaches draws the box: it shows what is due.
+  // A surface that attaches draws the box: it shows what is due, and whether an update waits.
   on('session.attach', async ($, e, next) => {
     const r = await next(e)
     poke($, false)
+    void check($)
 
     return r
   })
@@ -385,9 +409,31 @@ export const register: Register = on => {
         text: 'The box lists its earlier recaps under the goal, the newest first. Scroll down in it for older ones, or press ctrl+x tab, then the down arrow, and Page Up to go back.',
       }
     }
+    if (/^upgrade$/i.test(args)) {
+      // The steps a shell takes, by the claude on the PATH (an app may have none): one that fails says how by hand.
+      const steps = [
+        ['claude', 'plugin', 'marketplace', 'update', 'recap-box'],
+        ['claude', 'plugin', 'update', 'recap-box@recap-box'],
+      ]
+      for (const argv of steps) {
+        const r = await $.process
+          .run(argv, { timeoutMs: 120_000 })
+          .catch((err: unknown) => ({ exitCode: -1, stdout: '', stderr: String(err) }))
+        if (r.exitCode !== 0) {
+          return {
+            text: `Recap box was not updated: ${clean(r.stderr || r.stdout || `exit code ${r.exitCode}`).slice(0, 300)}. From a shell: ${steps.map(s => s.join(' ')).join(' && ')}, then /reload-plugins.`,
+          }
+        }
+      }
+      // Loads the new copy. A command's hook cannot run another (it would wait on the turn it holds), so a timer
+      // runs it once this one is done.
+      $.clock.after(0, () => void $.command.run({ command: 'reload-plugins' }).catch(() => undefined))
+
+      return { text: 'Recap box is at its newest version; reloading the plugins.' }
+    }
     if (args) {
       return {
-        text: '/recap-box shows or hides the box; /recap-box history shows or hides its earlier recaps. The box updates as the session works.',
+        text: '/recap-box shows or hides the box; /recap-box history shows or hides its earlier recaps; /recap-box upgrade installs its newest version. The box updates as the session works.',
       }
     }
     // Shown, it hides; a tab behind another pane, or one waiting for room, comes to the front.
@@ -523,6 +569,7 @@ export const register: Register = on => {
     // Every color a theme key, so the box follows the person's theme: the goal's label in Claude's own.
     return (
       <Box flexDirection="column" gap={1}>
+        {isBehind && <Text color="suggestion">Update available: /recap-box upgrade</Text>}
         <Box flexDirection="column">
           {name && <Text bold color={STAGES[name]}>{name.toUpperCase()}</Text>}
           {text === null ? (

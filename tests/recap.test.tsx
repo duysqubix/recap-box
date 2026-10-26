@@ -2,6 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
 import type {
   AgentInfo,
+  HttpResponse,
   ModelCompleteInput,
   ModelCompleteResult,
   On,
@@ -60,19 +61,35 @@ const calls = async ($: Engine, clock: MockClock) => {
   await clock.advance(2_000)
 }
 
-// The store, the end of a session and whether the box is drawn, as a test may stand them in.
+// GitHub's answer to whether main moved past the copy running: by default, a folder it cannot compare.
+type Fetched = { value: HttpResponse } | { deny: string }
+const NOT_FOUND: Fetched = { value: { status: 404, ok: false, headers: {}, text: '{"message":"Not Found"}' } }
+const compared = (aheadBy: number): Fetched => ({
+  value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ status: aheadBy ? 'ahead' : 'identical', ahead_by: aheadBy }) },
+})
+const UPDATE = 'Update available: /recap-box upgrade'
+const HOUR = 3_600_000
+
+// The store, the end of a session, whether the box is drawn and GitHub, as a test may stand them in.
 type Store = { get: (key: string) => unknown; set: (key: string, value: unknown) => unknown }
-type Options = { agents?: AgentInfo[]; store?: Store; end?: () => Promise<void>; isPlaced?: () => boolean }
+type Options = {
+  agents?: AgentInfo[]
+  store?: Store
+  end?: () => Promise<void>
+  isPlaced?: () => boolean
+  github?: (url: string) => Fetched
+}
 
 // Answers with what reached it; the prompt stand-in masks a key and drops a marked prompt, as a settings hook might.
 const engine = (
   on: On,
   messages: SessionMessage[] | (() => Promise<SessionMessage[]>),
   model: (e: ModelCompleteInput) => Answer | Promise<Answer>,
-  { agents = [], store = new Map(), end, isPlaced = () => true }: Options = {},
+  { agents = [], store = new Map(), end, isPlaced = () => true, github = () => NOT_FOUND }: Options = {},
 ) => {
   const entered: string[] = []
   on('command.register', () => ({ value: { command: 'recap-box' } }))
+  on('http.fetch', (_, e) => github(e.url))
   on('store.get', (_, e) => ({ value: store.get(e.key) }))
   on('store.set', (_, e) => ({ value: void store.set(e.key, e.value) }))
   // The box stays open until it is closed, and an open brings it back.
@@ -644,9 +661,9 @@ test('/recap-box hides the box, opens it and checks it; with words it says what 
   await ui.unmount()
 
   // Only the one word turns the history on or off.
-  for (const args of ['update 30', 'faster', ' please ', 'history on']) {
+  for (const args of ['update 30', 'faster', ' please ', 'history on', 'upgrade now']) {
     expect(await run(args)).toBe(
-      '/recap-box shows or hides the box; /recap-box history shows or hides its earlier recaps. The box updates as the session works.',
+      '/recap-box shows or hides the box; /recap-box history shows or hides its earlier recaps; /recap-box upgrade installs its newest version. The box updates as the session works.',
     )
   }
 
@@ -668,6 +685,157 @@ test('/recap-box shows a box that waits undrawn rather than hiding it', async ($
   const r = await $.command.run({ command: 'recap-box', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
   expect(r.text).toBe('Recap box opened.')
   await clock.advance(60_000)
+})
+
+test('the box says at its top while main holds a newer version, asking GitHub at the start and every hour', async ($, on) => {
+  const clock = mock.clock(on)
+  const urls: string[] = []
+  const answers = [compared(0), compared(3), compared(0)]
+  engine(on, [], () => say('Now: Working.'), {
+    github: url => {
+      urls.push(url)
+
+      return answers[urls.length - 1] ?? NOT_FOUND
+    },
+  })
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  // A /clear starts no session: the hourly check runs on.
+  await $.session.end(CLEAR)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const texts = async () => (await ui.findAll({ type: 'Text' })).map(t => t.text)
+  expect(await texts()).toEqual(['Waiting for activity.'])
+  // An hour on, main moved past the copy running.
+  await clock.advance(HOUR)
+  expect(await texts()).toEqual([UPDATE, 'Waiting for activity.'])
+  expect((await ui.find({ type: 'Text', text: UPDATE }))?.props.color).toBe('suggestion')
+  // Asked of the commit the copy's folder is named for, against main.
+  expect(urls.length).toBe(2)
+  for (const url of urls) expect(url).toMatch(/^https:\/\/api\.github\.com\/repos\/duysqubix\/recap-box\/compare\/[^/]+\.\.\.main$/)
+  // Once the copy running is main's own, the line goes.
+  await clock.advance(HOUR)
+  expect(await texts()).toEqual(['Waiting for activity.'])
+  await ui.unmount()
+})
+
+test('GitHub is asked at once only where someone watches: a person at the prompt, or a surface that attaches', async ($, on) => {
+  const clock = mock.clock(on)
+  const urls: string[] = []
+  engine(on, [], () => say('Now: Working.'), {
+    github: url => {
+      urls.push(url)
+
+      return compared(3)
+    },
+  })
+
+  // A -p run or an SDK host starts this way: nobody watches yet.
+  await $.session.start({ cwd: '/', surface: null, isInteractive: false })
+  await clock.advance(1_000)
+  expect(urls.length).toBe(0)
+  await $.session.attach({ surface: 'desktop', clientId: 'd1' })
+  await clock.advance(1_000)
+  expect(urls.length).toBe(1)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual([UPDATE, 'Waiting for activity.'])
+  await ui.unmount()
+})
+
+test('a copy GitHub cannot compare, or an answer that cannot be read, shows no update', async ($, on) => {
+  const clock = mock.clock(on)
+  let answer = compared(3)
+  engine(on, [], () => say('Now: Working.'), { github: () => answer })
+  const fails: Fetched[] = [
+    // A folder that names no commit (a clone), a request over GitHub's limit, a page that is not GitHub's, a refusal.
+    NOT_FOUND,
+    { value: { status: 403, ok: false, headers: {}, text: '{"ahead_by":3}' } },
+    { value: { status: 200, ok: true, headers: {}, text: '<html>Sign in to the network</html>' } },
+    { deny: 'web fetch blocked' },
+  ]
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const texts = async () => (await ui.findAll({ type: 'Text' })).map(t => t.text)
+  for (const fail of fails) {
+    answer = compared(3)
+    await clock.advance(HOUR)
+    expect(await texts()).toEqual([UPDATE, 'Waiting for activity.'])
+    answer = fail
+    await clock.advance(HOUR)
+    expect(await texts()).toEqual(['Waiting for activity.'])
+  }
+  await ui.unmount()
+})
+
+test('/recap-box upgrade updates the marketplace, then the mod, then reloads the plugins', async ($, on) => {
+  const clock = mock.clock(on)
+  engine(on, [], () => say('Now: Working.'))
+  const ran: string[] = []
+  on('process.run', (_, e) => {
+    ran.push(e.argv.join(' '))
+
+    return { value: { exitCode: 0, stdout: 'Updated.', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  let reloads = 0
+  on('command.run', { command: 'reload-plugins' }, () => {
+    reloads += 1
+
+    return { text: 'Reloaded.' }
+  })
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const r = await $.command.run({ command: 'recap-box', args: 'upgrade', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  expect(r.text).toBe('Recap box is at its newest version; reloading the plugins.')
+  expect(ran).toEqual(['claude plugin marketplace update recap-box', 'claude plugin update recap-box@recap-box'])
+  // The reload runs once the command is done.
+  expect(reloads).toBe(0)
+  await clock.advance(0)
+  expect(reloads).toBe(1)
+})
+
+test('/recap-box upgrade that fails or cannot start says how to update by hand, and reloads nothing', async ($, on) => {
+  const clock = mock.clock(on)
+  engine(on, [], () => say('Now: Working.'))
+  const ran: string[] = []
+  const result = (exitCode: number, stderr: string) => ({
+    value: { exitCode, stdout: '', stderr, isStdoutTruncated: false, isStderrTruncated: false },
+  })
+  let answer: (argv: string) => ReturnType<typeof result> | { deny: string } = () => result(1, 'Marketplace "recap-box" not found\n')
+  on('process.run', (_, e) => {
+    ran.push(e.argv.join(' '))
+
+    return answer(e.argv.join(' '))
+  })
+  let reloads = 0
+  on('command.run', { command: 'reload-plugins' }, () => {
+    reloads += 1
+
+    return { text: 'Reloaded.' }
+  })
+  const run = async () =>
+    (await $.command.run({ command: 'recap-box', args: 'upgrade', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })).text
+  const BY_HAND = 'From a shell: claude plugin marketplace update recap-box && claude plugin update recap-box@recap-box, then /reload-plugins.'
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  // The marketplace fails: the mod is not touched.
+  expect(await run()).toBe(`Recap box was not updated: Marketplace "recap-box" not found. ${BY_HAND}`)
+  expect(ran).toEqual(['claude plugin marketplace update recap-box'])
+  // The mod's own update fails.
+  answer = argv => (argv.includes('marketplace') ? result(0, '') : result(1, 'Plugin "recap-box" is not installed'))
+  expect(await run()).toBe(`Recap box was not updated: Plugin "recap-box" is not installed. ${BY_HAND}`)
+  // A failure that says nothing names its exit code; one that says too much is cut.
+  answer = () => result(2, '')
+  expect(await run()).toBe(`Recap box was not updated: exit code 2. ${BY_HAND}`)
+  answer = () => result(1, 'e'.repeat(5_000))
+  expect(await run()).toBe(`Recap box was not updated: ${'e'.repeat(300)}. ${BY_HAND}`)
+  // No claude to run, as in an app whose PATH has none.
+  answer = () => ({ deny: 'spawn claude ENOENT' })
+  const text = await run()
+  expect(text).toContain('spawn claude ENOENT')
+  expect(text).toMatch(/^Recap box was not updated: /)
+  expect(text).toContain(BY_HAND)
+  await clock.advance(1_000)
+  expect(reloads).toBe(0)
 })
 
 test('a store that cannot be read or written leaves the box at work', async ($, on) => {

@@ -11,7 +11,7 @@ A Claude Code mod: a small box beside the transcript that says, in plain words, 
 
 `/recap-box` opens the box again after you close it. `/recap-box update 30` makes it check every 30 seconds instead of 60, from 10 to 3600.
 
-`/recap-box history` turns the history on or off. With it on, the box lists the session's recaps above the goal, the newest last, each earlier one dimmed under the stage it was written in. Scroll up in the box for older ones: with the mouse wheel in the fullscreen layout, or with the arrow and page keys after ctrl+x tab moves the focus to the box. Esc moves it back. The box follows each new recap while it shows the newest. It keeps the last 200, and a /clear or /resume starts the list over.
+`/recap-box history` turns the history on or off. With it on, the recap and the goal stay at the top of the box, and the session's earlier recaps run below them, the newest first, each dimmed under the stage it was written in. Scroll down in the box for older ones with the mouse wheel in the fullscreen layout, one recap a step. From the keyboard, ctrl+x tab moves the focus to the box: the down arrow or Page Down moves one recap older, Page Up one newer, and Home and End go to the newest and the oldest. Esc moves the focus back to the prompt. The box keeps your place as new recaps come in. Where it sits above the prompt (outside the fullscreen layout, or in a terminal under 110 columns), the box is too short to hold the recap and goal still, so it scrolls as a whole. It keeps the last 200, and a /clear or /resume starts the list over.
 
 Later sessions keep both settings; sessions already open keep theirs until they restart.
 

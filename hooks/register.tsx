@@ -21,10 +21,8 @@ const asks = atom({ plugin: 'recap-box', key: 'asks' } as const, [])
 const stage = atom({ plugin: 'recap-box', key: 'stage' } as const, null)
 // Every recap so far, oldest first, under the stage it was written in.
 const history = atom({ plugin: 'recap-box', key: 'history' } as const, [])
-// Recaps the history keeps, oldest dropped first: over three hours at one a minute. And the characters they
-// hold at most: a drawing draws 100,000 in all, so past that the newest would go undrawn.
+// Recaps the history keeps, oldest dropped first: over three hours at one a minute.
 const HISTORY = 200
-const HISTORY_CHARS = 90_000
 
 // The stages a recap can name, each drawn in its theme color.
 const STAGES: Record<Stage, ThemeKey> = {
@@ -169,28 +167,55 @@ let epoch = 0
 let isBusy = false
 // Seconds to the next check.
 let left = EVERY_S
-// Whether the box's window showed the newest recap after its last move: only then does a new one scroll it.
-let isAtEnd = true
+// The earlier recap the person scrolled down to, or null at the newest. The box moves them under the recap and goal
+// itself, so those two stay at its top. Counted from the oldest, the place holds as new recaps come in.
+let place: number | null = null
+// Whether the box sits inline above the prompt in the terminal, too short to hold the recap and goal still.
+let isInline = false
 
-// Brings the newest recap into view. The engine keeps it there as the history grows, until the person scrolls.
-function follow($: EngineInterface) {
-  isAtEnd = true
+// The recaps before the one on show, oldest first: all of them while a notice is on show.
+async function earlier($: EngineInterface, text: string | null) {
+  const list = await read($, history)
+
+  return list.at(-1)?.text === text ? list.slice(0, -1) : list
+}
+
+// Moves the person's place that many recaps older, or newer when negative, never past the oldest. Back at the newest,
+// it follows new recaps again.
+async function scroll($: EngineInterface, by: number) {
+  const was = epoch
+  const last = (await earlier($, await read($, recap))).length - 1
+  // A /clear meanwhile started another conversation, at its newest.
+  if (was !== epoch) return
+  const at = Math.max(0, (place ?? last) - by)
+  place = at < last ? at : null
+  $.ui.invalidate('ui.render')
+}
+
+// Shows the newest earlier recaps, with the box's window back at its top.
+function top($: EngineInterface) {
+  place = null
+  $.ui.invalidate('ui.render')
   // Best effort: where nothing can scroll the box (the test kit has no window), it stays put.
-  $.ui.scroll({ in: PANE, to: 'end' }).catch(() => undefined)
+  $.ui.scroll({ in: PANE, to: 'start' }).catch(() => undefined)
 }
 
 // Puts a recap on show and adds it to the history, under the stage it was written in.
 async function say($: EngineInterface, at: number, text: string) {
   const name = await read($, stage)
   await update($, recap, old => (at === epoch ? text : old))
+  let isDropped = false
   await update($, history, list => {
-    if (at !== epoch || list.at(-1)?.text === text) return list
-    const kept = [...list, { stage: name, text }].slice(-HISTORY)
-    while (kept.reduce((n, p) => n + p.text.length, 0) > HISTORY_CHARS) kept.shift()
+    const isAdded = at === epoch && list.at(-1)?.text !== text
+    isDropped = isAdded && list.length >= HISTORY
 
-    return kept
+    return isAdded ? [...list, { stage: name, text }].slice(-HISTORY) : list
   })
-  if (isAtEnd && isHistoryShown) follow($)
+  // Past the cap the oldest drops, so the place moves down one to stay on the same recap.
+  if (isDropped && place) {
+    place -= 1
+    $.ui.invalidate('ui.render')
+  }
 }
 
 // While the box is drawn: read the stage, and re-summarize when the transcript's tail changed.
@@ -263,6 +288,8 @@ export const register: Register = on => {
     // A reload can draw the box before this read.
     $.ui.invalidate('ui.render')
     void $.ui.open({ id: PANE, title: 'Recap', columns: 40 })
+    // An earlier version may have left the window following the box's end, where the oldest recaps now are.
+    if (isHistoryShown) top($)
     $.clock.every(1000, () => void tick($))
 
     return next(e)
@@ -278,9 +305,11 @@ export const register: Register = on => {
       $.ui.invalidate('ui.render')
       if (!isShown) return { text: 'The box shows the latest recap only.' }
       await $.ui.open({ id: PANE, title: 'Recap', columns: 40 })
-      follow($)
+      top($)
 
-      return { text: 'The box lists its recaps, the newest last. Scroll up in it for older ones, or press ctrl+x tab, then the arrow keys.' }
+      return {
+        text: 'The box lists its earlier recaps under the goal, the newest first. Scroll down in it for older ones, or press ctrl+x tab, then the down arrow, and Page Up to go back.',
+      }
     }
     if (args) {
       const s = Number(/^update\s+(\d+)s?$/i.exec(args)?.[1])
@@ -297,7 +326,7 @@ export const register: Register = on => {
       return { text: `The box checks every ${s}s.` }
     }
     await $.ui.open({ id: PANE, title: 'Recap', columns: 40 })
-    if (isHistoryShown) follow($)
+    if (isHistoryShown) top($)
 
     return { text: 'Recap box opened.' }
   })
@@ -321,7 +350,7 @@ export const register: Register = on => {
   on('session.end', async ($, e, next) => {
     seen = ''
     epoch += 1
-    isAtEnd = true
+    place = null
     // First, so a prompt that follows the /clear at once is not wiped with the old asks.
     await update($, asks, () => [])
     await update($, recap, () => null)
@@ -340,32 +369,38 @@ export const register: Register = on => {
     return r
   })
 
-  // The person's wheel or keys moved the window: it follows new recaps again once it shows the newest.
+  // With the history on, the wheel and the keys move the earlier recaps, down only while the box cuts some off, and
+  // the window stays at the top: the recap and goal never scroll away. The engine sends no up arrow while its window
+  // is at the top, so the wheel and Page Up go back. Inline, the box is too short for that, and it scrolls whole.
   on('ui.scroll', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
-    const r = await next(e)
-    if (!r.deny) isAtEnd = e.offset >= e.contentRows - e.bodyRows
+    if (!isHistoryShown || isInline) return next(e)
+    // The engine counts rows: the wheel moves a recap a tick, a key one recap, and Home and End, which ask for the
+    // whole tree, go to the newest and the oldest. Where the tree just fills the box a page key asks for as many, so
+    // that counts as a page key.
+    const isEnd = Math.abs(e.by) === e.contentRows && e.contentRows !== e.bodyRows
+    const by = e.pointer ? e.by : Math.sign(e.by) * (isEnd ? HISTORY : 1)
+    if (by < 0 || e.contentRows > e.bodyRows) await scroll($, by)
 
-    return r
+    return next({ ...e, offset: 0 })
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
+    const isHere = e.props.placement === 'inline'
+    // ponytail: ui.scroll names no surface, so the terminal's seat decides how the box scrolls; others draw their own.
+    // A session with no terminal holds the window at the top even inline: keep each surface's seat if that comes up.
+    if (e.surface === 'terminal') isInline = isHere
     const text = await read($, recap)
     const aim = await read($, goal)
     const name = await read($, stage)
-    // The recaps before the one on show, oldest first: all of them while a notice is on show. Taller than the box, they scroll.
-    const list = isHistoryShown ? await read($, history) : []
-    const past = list.at(-1)?.text === text ? list.slice(0, -1) : list
+    // The newest first, from the person's place, or all of them where the window scrolls; those past the box's foot
+    // go unseen.
+    const list = isHistoryShown ? await earlier($, text) : []
+    const past = (isHere || place === null ? list : list.slice(0, place + 1)).toReversed()
 
     // Every color a theme key, so the box follows the person's theme: the goal's label in Claude's own.
     return (
       <Box flexDirection="column" gap={1}>
-        {past.map(p => (
-          <Box flexDirection="column">
-            {p.stage && <Text color={STAGES[p.stage]}>{p.stage.toUpperCase()}</Text>}
-            <Text color="inactive">{p.text}</Text>
-          </Box>
-        ))}
         <Box flexDirection="column">
           {name && <Text bold color={STAGES[name]}>{name.toUpperCase()}</Text>}
           {text === null ? (
@@ -380,6 +415,12 @@ export const register: Register = on => {
             <Text color="text">{aim}</Text>
           </Box>
         )}
+        {past.map(p => (
+          <Box flexDirection="column">
+            {p.stage && <Text color={STAGES[p.stage]}>{p.stage.toUpperCase()}</Text>}
+            <Text color="inactive">{p.text}</Text>
+          </Box>
+        ))}
       </Box>
     )
   })

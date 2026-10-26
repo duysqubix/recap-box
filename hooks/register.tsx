@@ -13,6 +13,9 @@ const GAP_MS = 10_000
 const DELAYS = 5
 // A check that still reads the transcript a /resume left tries again this many times.
 const TRIES = 5
+// Whether the box lists the recaps before the one on show, read from the store at each start.
+// Not in `$.state`: a /clear goes on under another session, whose values start over.
+let isHistoryShown = false
 const recap = atom({ plugin: 'recap-box', key: 'recap' } as const, null)
 // What the whole session works toward, pinned under the recap.
 const goal = atom({ plugin: 'recap-box', key: 'goal' } as const, null)
@@ -20,6 +23,10 @@ const goal = atom({ plugin: 'recap-box', key: 'goal' } as const, null)
 // ponytail: prompts sent before the mod loaded (a resumed session) are missing; the goal then reads the tail.
 const asks = atom({ plugin: 'recap-box', key: 'asks' } as const, [])
 const stage = atom({ plugin: 'recap-box', key: 'stage' } as const, null)
+// Every recap so far, oldest first, under the stage it was written in.
+const history = atom({ plugin: 'recap-box', key: 'history' } as const, [])
+// Recaps the history keeps, oldest dropped first.
+const HISTORY = 200
 
 // The stages a recap can name, each drawn in its theme color.
 const STAGES: Record<Stage, ThemeKey> = {
@@ -179,6 +186,56 @@ let delays = 0
 // the transcript the resume brings, messages() still reads the old one.
 let outgoing = ''
 let tries = 0
+// The earlier recap the person scrolled down to, or null at the newest. The box moves them under the recap and goal
+// itself, so those two stay at its top. Counted from the oldest, the place holds as new recaps come in.
+let place: number | null = null
+// Whether the box sits inline above the prompt in the terminal, too short to hold the recap and goal still.
+let isInline = false
+
+// The recaps before the one on show, oldest first: all of them while a notice is on show.
+async function earlier($: EngineInterface, text: string | null) {
+  const list = await read($, history)
+
+  return list.at(-1)?.text === text ? list.slice(0, -1) : list
+}
+
+// Moves the person's place that many recaps older, or newer when negative, never past the oldest. Back at the newest,
+// it follows new recaps again.
+async function scroll($: EngineInterface, by: number) {
+  const was = epoch
+  const last = (await earlier($, await read($, recap))).length - 1
+  // A /clear meanwhile started another conversation, at its newest.
+  if (was !== epoch) return
+  const at = Math.max(0, (place ?? last) - by)
+  place = at < last ? at : null
+  $.ui.invalidate('ui.render')
+}
+
+// Shows the newest earlier recaps, with the box's window back at its top.
+function top($: EngineInterface) {
+  place = null
+  $.ui.invalidate('ui.render')
+  // Best effort: where nothing can scroll the box (the test kit has no window), it stays put.
+  $.ui.scroll({ in: PANE, to: 'start' }).catch(() => undefined)
+}
+
+// Puts a recap on show and adds it to the history, under the stage it was written in.
+async function say($: EngineInterface, at: number, text: string) {
+  const name = await read($, stage)
+  await update($, recap, old => (at === epoch ? text : old))
+  let isDropped = false
+  await update($, history, list => {
+    const isAdded = at === epoch && list.at(-1)?.text !== text
+    isDropped = isAdded && list.length >= HISTORY
+
+    return isAdded ? [...list, { stage: name, text }].slice(-HISTORY) : list
+  })
+  // Past the cap the oldest drops, so the place moves down one to stay on the same recap.
+  if (isDropped && place) {
+    place -= 1
+    $.ui.invalidate('ui.render')
+  }
+}
 
 // Each event puts the check off again, so a burst of them makes one, but only so often: a call
 // every second still gets its checks. A timer outlives the hook that set it, so no hook waits on Haiku.
@@ -267,11 +324,11 @@ async function refresh($: EngineInterface) {
       // Every line but the goal's is the recap.
       const aim = clean(reply.text.match(GOAL)?.[1] ?? '')
       const text = clean(reply.text.replace(GOAL, '').replace(NOW, ''))
-      await update($, recap, old => (at === epoch ? text || old : old))
+      if (text) await say($, at, text)
       if (aim && !SAME.test(aim)) await update($, goal, old => (at === epoch ? aim : old))
     }
   } catch (err) {
-    // Only a request the engine refuses to send rejects (a blocked model): say so in the box.
+    // Only a request the engine refuses to send rejects (a blocked model): say so in the box, not in its history.
     await update($, recap, old => (at === epoch ? clean(`No recap: ${String(err)}`) : old))
   } finally {
     isBusy = false
@@ -285,8 +342,18 @@ async function refresh($: EngineInterface) {
 export const register: Register = on => {
   // Opened on every start: the desktop app, VS Code and mobile attach after a start without a surface.
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'recap-box', description: 'Open the session recap box' })
+    await $.command.register({
+      name: 'recap-box',
+      description: 'Open the session recap box, or show or hide its history',
+      argumentHint: '[history]',
+    })
+    // The store is a file anyone can edit: anything but true, or a value that cannot be read, leaves the history off.
+    isHistoryShown = (await $.store.get('history').catch(() => undefined)) === true
+    // A reload can draw the box before this read.
+    $.ui.invalidate('ui.render')
     void $.ui.open({ id: PANE, title: 'Recap', columns: 40 })
+    // An earlier version may have left the window following the box's end, where the oldest recaps now are.
+    if (isHistoryShown) top($)
     // A resumed session has a transcript already: recap it once the box is drawn.
     poke($, true)
 
@@ -302,8 +369,28 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'recap-box' }, async ($, e) => {
-    if (e.args.trim()) return { text: '/recap-box opens the box. It updates as the session works.' }
+    const args = e.args.trim()
+    if (/^history$/i.test(args)) {
+      const isShown = !isHistoryShown
+      // Kept for later sessions, so saved first: a failed save changes nothing.
+      await $.store.set('history', isShown)
+      isHistoryShown = isShown
+      $.ui.invalidate('ui.render')
+      if (!isShown) return { text: 'The box shows the latest recap only.' }
+      await $.ui.open({ id: PANE, title: 'Recap', columns: 40 })
+      top($)
+
+      return {
+        text: 'The box lists its earlier recaps under the goal, the newest first. Scroll down in it for older ones, or press ctrl+x tab, then the down arrow, and Page Up to go back.',
+      }
+    }
+    if (args) {
+      return {
+        text: '/recap-box opens the box; /recap-box history shows or hides its earlier recaps. The box updates as the session works.',
+      }
+    }
     await $.ui.open({ id: PANE, title: 'Recap', columns: 40 })
+    if (isHistoryShown) top($)
     poke($, false)
 
     return { text: 'Recap box opened.' }
@@ -358,10 +445,11 @@ export const register: Register = on => {
     return r
   })
 
-  // A /clear or /resume starts another conversation: its recap and goal start over.
+  // A /clear or /resume starts another conversation: its recap, goal and history start over.
   on('session.end', async ($, e, next) => {
     seen = ''
     epoch += 1
+    place = null
     // Nothing of the old conversation is due.
     timer?.cancel()
     timer = undefined
@@ -374,6 +462,7 @@ export const register: Register = on => {
     await update($, recap, () => null)
     await update($, goal, () => null)
     await update($, stage, () => null)
+    await update($, history, () => [])
     // Read before the end: after it, a check may still read this tail for a while.
     outgoing = e.reason === 'resume' ? transcript((await $.session.messages()).slice(-60)) : ''
     // Again once the end is done: a check that started meanwhile read the old conversation.
@@ -383,14 +472,34 @@ export const register: Register = on => {
     await update($, recap, () => null)
     await update($, goal, () => null)
     await update($, stage, () => null)
+    await update($, history, () => [])
     // A /resume brings a transcript of its own: recap it. A /clear brings none, and an exit or logout ends here.
     if (e.reason === 'resume') poke($, true)
 
     return r
   })
 
+  // With the history on, the wheel and the keys move the earlier recaps, down only while the box cuts some off, and
+  // the window stays at the top: the recap and goal never scroll away. The engine sends no up arrow while its window
+  // is at the top, so the wheel and Page Up go back. Inline, the box is too short for that, and it scrolls whole.
+  on('ui.scroll', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
+    if (!isHistoryShown || isInline) return next(e)
+    // The engine counts rows: the wheel moves a recap a tick, a key one recap, and Home and End, which ask for the
+    // whole tree, go to the newest and the oldest. Where the tree just fills the box a page key asks for as many, so
+    // that counts as a page key.
+    const isEnd = Math.abs(e.by) === e.contentRows && e.contentRows !== e.bodyRows
+    const by = e.pointer ? e.by : Math.sign(e.by) * (isEnd ? HISTORY : 1)
+    if (by < 0 || e.contentRows > e.bodyRows) await scroll($, by)
+
+    return next({ ...e, offset: 0 })
+  })
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
+    const isHere = e.props.placement === 'inline'
+    // ponytail: ui.scroll names no surface, so the terminal's seat decides how the box scrolls; others draw their own.
+    // A session with no terminal holds the window at the top even inline: keep each surface's seat if that comes up.
+    if (e.surface === 'terminal') isInline = isHere
     const text = await read($, recap)
     const aim = await read($, goal)
     const name = await read($, stage)
@@ -398,6 +507,10 @@ export const register: Register = on => {
     // waited undrawn is checked now. Only with nothing pending, so the check's own writes, which
     // draw the box again, schedule nothing.
     if (wanted > met && !timer && !isBusy) soon($)
+    // The newest first, from the person's place, or all of them where the window scrolls; those past the box's foot
+    // go unseen.
+    const list = isHistoryShown ? await earlier($, text) : []
+    const past = (isHere || place === null ? list : list.slice(0, place + 1)).toReversed()
 
     // Every color a theme key, so the box follows the person's theme: the goal's label in Claude's own.
     return (
@@ -416,6 +529,12 @@ export const register: Register = on => {
             <Text color="text">{aim}</Text>
           </Box>
         )}
+        {past.map(p => (
+          <Box flexDirection="column">
+            {p.stage && <Text color={STAGES[p.stage]}>{p.stage.toUpperCase()}</Text>}
+            <Text color="inactive">{p.text}</Text>
+          </Box>
+        ))}
       </Box>
     )
   })

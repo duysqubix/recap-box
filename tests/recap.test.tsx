@@ -654,6 +654,17 @@ test('/recap-box hides the box, opens it and checks it; with words it says what 
   expect(prompts.at(-1)?.match(/^- .*$/gm)).toEqual(['- fix the login page'])
 })
 
+test('/recap-box shows a box that waits undrawn rather than hiding it', async ($, on) => {
+  const clock = mock.clock(on)
+  engine(on, [], () => say('Now: Working.'), { isPlaced: () => false })
+
+  // Opened at the start where nothing draws it, the box waits for room: the command brings it up, never down.
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const r = await $.command.run({ command: 'recap-box', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  expect(r.text).toBe('Recap box opened.')
+  await clock.advance(60_000)
+})
+
 test('a store that cannot be read or written leaves the box at work', async ($, on) => {
   const clock = mock.clock(on)
   let asked = 0

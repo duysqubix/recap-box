@@ -58,18 +58,21 @@ const calls = async ($: Engine, clock: MockClock) => {
   await clock.advance(2_000)
 }
 
-// The end of a session and whether the box is drawn, as a test may stand them in.
-type Options = { agents?: AgentInfo[]; end?: () => Promise<void>; isPlaced?: () => boolean }
+// The store, the end of a session and whether the box is drawn, as a test may stand them in.
+type Store = { get: (key: string) => unknown; set: (key: string, value: unknown) => unknown }
+type Options = { agents?: AgentInfo[]; store?: Store; end?: () => Promise<void>; isPlaced?: () => boolean }
 
 // Answers with what reached it; the prompt stand-in masks a key and drops a marked prompt, as a settings hook might.
 const engine = (
   on: On,
   messages: SessionMessage[] | (() => Promise<SessionMessage[]>),
   model: (e: ModelCompleteInput) => Answer | Promise<Answer>,
-  { agents = [], end, isPlaced = () => true }: Options = {},
+  { agents = [], store = new Map(), end, isPlaced = () => true }: Options = {},
 ) => {
   const entered: string[] = []
   on('command.register', () => ({ value: { command: 'recap-box' } }))
+  on('store.get', (_, e) => ({ value: store.get(e.key) }))
+  on('store.set', (_, e) => ({ value: void store.set(e.key, e.value) }))
   // The box stays open until it is closed, and an open brings it back.
   let isOpen = false
   on('ui.open', () => {
@@ -630,8 +633,8 @@ test('/recap-box hides the box, opens it and checks it; with words it says what 
   expect(prompts.length).toBe(1)
   await ui.unmount()
 
-  for (const args of ['update 30', 'faster', ' please ']) {
-    expect(await run(args)).toBe('/recap-box shows or hides the box. It updates as the session works.')
+  for (const args of ['update 30', 'faster', ' please ', 'history on']) {
+    expect(await run(args)).toBe('/recap-box shows or hides the box; /recap-box history shows or hides its earlier recaps. It updates as the session works.')
   }
 
   // The box's own command asks for nothing: it is no part of the goal.
@@ -641,6 +644,46 @@ test('/recap-box hides the box, opens it and checks it; with words it says what 
   await ends($, clock)
   expect(prompts.length).toBe(2)
   expect(prompts.at(-1)?.match(/^- .*$/gm)).toEqual(['- fix the login page'])
+})
+
+test('a store that cannot be read or written leaves the box at work', async ($, on) => {
+  const clock = mock.clock(on)
+  let calls = 0
+  const broken: Store = {
+    get: () => {
+      throw new Error('the store file is not JSON')
+    },
+    set: () => {
+      throw new Error('the disk is full')
+    },
+  }
+  const messages: SessionMessage[] = [{ role: 'user', text: 'one', toolUses: [] }]
+  engine(
+    on,
+    messages,
+    () => {
+      calls += 1
+
+      return say(`Now: Working ${calls}.`)
+    },
+    { store: broken },
+  )
+  const run = (args: string) =>
+    $.command
+      .run({ command: 'recap-box', args, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+      .then(() => 'saved', () => 'refused')
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ends($, clock)
+  expect(calls).toBe(1)
+  // A save that fails changes nothing, not even for this session.
+  expect(await run('history')).toBe('refused')
+  messages.push({ role: 'assistant', text: 'two', toolUses: [] })
+  await ends($, clock)
+  expect(calls).toBe(2)
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['Working 2.'])
+  await ui.unmount()
 })
 
 test('a refused model call says so in the box', async ($, on) => {
@@ -1143,4 +1186,292 @@ test("an ask is what entered beneath, from the person's own origins alone", asyn
     '- my key is [masked]',
     `- ${'x'.repeat(1199)}`,
   ])
+})
+
+test('with history on, the earlier recaps run under the recap and goal, the newest first, under the stage each was written in', async ($, on) => {
+  const clock = mock.clock(on)
+  const store = new Map<string, unknown>()
+  const messages: SessionMessage[] = [did(READ)]
+  const replies = ['Now: Reading the code.\nGoal: Add a history.', 'Now: Changing the box.', 'Now: Changing the box.', 'Now: Checking the box.']
+  engine(on, messages, () => say(replies.shift() ?? ''), { store })
+  const run = async (args: string) =>
+    (await $.command.run({ command: 'recap-box', args, origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 160 } })).text
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await ends($, clock)
+  messages.push(did(EDIT))
+  await ends($, clock)
+  // The same recap again adds no entry.
+  messages.push(did(EDIT))
+  await ends($, clock)
+  messages.push(did(sh('npm test')))
+  await ends($, clock)
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const shown = async () => (await ui.findAll({ type: 'Text' })).map(t => t.text)
+    // Off, as a first session starts: the latest recap alone.
+    expect(await shown()).toEqual(['TESTING', 'Checking the box.', 'GOAL', 'Add a history.'])
+    expect(await run('history')).toBe(
+      'The box lists its earlier recaps under the goal, the newest first. Scroll down in it for older ones, or press ctrl+x tab, then the down arrow, and Page Up to go back.',
+    )
+    expect(store.get('history')).toBe(true)
+    expect(await shown()).toEqual([
+      'TESTING',
+      'Checking the box.',
+      'GOAL',
+      'Add a history.',
+      'CODING',
+      'Changing the box.',
+      'RESEARCHING',
+      'Reading the code.',
+    ])
+    // The earlier recaps are dimmed under their stage's color, in theme keys; the one on show stands out.
+    expect((await ui.find({ type: 'Text', text: 'CODING' }))?.props).toEqual({ color: 'claude' })
+    expect((await ui.find({ type: 'Text', text: 'Changing the box.' }))?.props).toEqual({ color: 'inactive' })
+    expect((await ui.find({ type: 'Text', text: 'TESTING' }))?.props).toMatchObject({ bold: true, color: 'autoAccept' })
+    expect(await run(' HISTORY ')).toBe('The box shows the latest recap only.')
+    expect(store.get('history')).toBe(false)
+    expect(await shown()).toEqual(['TESTING', 'Checking the box.', 'GOAL', 'Add a history.'])
+    await ui.unmount()
+  }
+})
+
+for (const [kept, isShown] of [[true, true], ['true', false], [1, false]] as const) {
+  test(`a session starts with the history ${isShown ? 'shown' : 'hidden'} when the kept value is ${JSON.stringify(kept)}, and a /clear empties it`, async ($, on) => {
+    const clock = mock.clock(on)
+    const messages: SessionMessage[] = [did(READ)]
+    const replies = ['Now: First.', 'Now: Second.', 'Now: Third.']
+    engine(on, messages, () => say(replies.shift() ?? ''), { store: new Map<string, unknown>([['history', kept]]) })
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    const shown = async () => (await ui.findAll({ type: 'Text' })).map(t => t.text)
+    await ends($, clock)
+    messages.push(did(EDIT))
+    await ends($, clock)
+    expect(await shown()).toEqual(isShown ? ['CODING', 'Second.', 'RESEARCHING', 'First.'] : ['CODING', 'Second.'])
+
+    // The next conversation's history starts with its own first recap.
+    messages.splice(0, messages.length, did(sh('npm test')))
+    await $.session.end(CLEAR)
+    expect(await shown()).toEqual(['Waiting for activity.'])
+    await ends($, clock)
+    expect(await shown()).toEqual(['TESTING', 'Third.'])
+    await ui.unmount()
+  })
+}
+
+test("the history keeps the newest 200 recaps, and the person's place as the oldest drops", async ($, on) => {
+  const clock = mock.clock(on)
+  const messages: SessionMessage[] = []
+  let n = 0
+  engine(on, messages, () => say(`Now: Recap ${++n}.`), { store: new Map<string, unknown>([['history', true]]) })
+  on('ui.scroll', () => ({}))
+  const check = async () => {
+    messages.push({ role: 'assistant', text: String(n), toolUses: [] })
+    await ends($, clock)
+  }
+  // A live surface draws as each write lands, so a place moved after one must draw again.
+  let isDrawn = false
+  on('state.set', async (_, e, next) => {
+    const r = await next(e)
+    if (isDrawn) await ui.findAll({ type: 'Text' })
+
+    return r
+  })
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  for (let i = 0; i < 201; i++) await check()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  isDrawn = true
+  // How many lines show, the first two and the last.
+  const edges = async () => {
+    const shown = (await ui.findAll({ type: 'Text' })).map(t => t.text)
+
+    return [shown.length, shown[0], shown[1], shown.at(-1)]
+  }
+  expect(await edges()).toEqual([200, 'Recap 201.', 'Recap 200.', 'Recap 2.'])
+
+  // A tick down passes Recap 200; the next recap drops Recap 2, and the box still starts from Recap 199.
+  await $.ui.scroll({ component: 'Pane', requestId: 'recap', offset: 1, by: 1, bodyRows: 20, contentRows: 40, origin: { kind: 'person' }, pointer: { column: 5, row: 15 } })
+  await check()
+  expect(await edges()).toEqual([198, 'Recap 202.', 'Recap 199.', 'Recap 3.'])
+  // At the oldest, End's place, the next drop leaves the box on the new oldest.
+  await $.ui.scroll({ component: 'Pane', requestId: 'recap', offset: 20, by: 40, bodyRows: 20, contentRows: 40, origin: { kind: 'person' } })
+  await check()
+  expect(await edges()).toEqual([2, 'Recap 203.', 'Recap 4.', 'Recap 4.'])
+  await ui.unmount()
+})
+
+test('a scroll that reads the history while a /clear ends the conversation leaves the next one at its newest', async ($, on) => {
+  const clock = mock.clock(on)
+  const messages: SessionMessage[] = []
+  let n = 0
+  engine(on, messages, () => say(`Now: Recap ${++n}.`), { store: new Map<string, unknown>([['history', true]]) })
+  on('ui.scroll', () => ({}))
+  // The scroll's read of the history takes a moment, and the /clear lands in it.
+  let onRead: (() => void) | undefined
+  on('state.get', async (_, e, next) => {
+    const r = await next(e)
+    if (onRead && e.key === 'history') {
+      onRead()
+      onRead = undefined
+      await clock.sleep(5_000)
+    }
+
+    return r
+  })
+  const check = async () => {
+    messages.push({ role: 'assistant', text: String(n), toolUses: [] })
+    await ends($, clock)
+  }
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  for (let i = 0; i < 5; i++) await check()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const isRead = new Promise<void>(resolve => (onRead = () => resolve()))
+  const moving = $.ui.scroll({ component: 'Pane', requestId: 'recap', offset: 1, by: 1, bodyRows: 20, contentRows: 40, origin: { kind: 'person' }, pointer: { column: 5, row: 15 } })
+  await isRead
+  await $.session.end(CLEAR)
+  await clock.advance(5_000)
+  await moving
+
+  // The old conversation's place stays out: the box follows the new one's recaps from the newest.
+  for (let i = 0; i < 8; i++) await check()
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual([13, 12, 11, 10, 9, 8, 7, 6].map(k => `Recap ${k}.`))
+  await ui.unmount()
+})
+
+// The kit has no window: whether the recap and goal stay in view as the box scrolls is checked in a live session.
+test('the wheel and the keys move the earlier recaps under the recap and goal, and the window stays at the top', async ($, on) => {
+  const clock = mock.clock(on)
+  const messages: SessionMessage[] = []
+  let n = 0
+  engine(on, messages, () => say(`Now: Recap ${++n}.\nGoal: Read the box.`))
+  const moves: unknown[] = []
+  on('ui.scroll', (_, e) => {
+    moves.push(e)
+
+    return {}
+  })
+  const run = (args: string) =>
+    $.command.run({ command: 'recap-box', args, origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 160 } })
+  const check = async () => {
+    messages.push({ role: 'assistant', text: String(n), toolUses: [] })
+    await ends($, clock)
+  }
+  // The person's moves as the engine raises them from the top, over a tree taller than the box unless told: a wheel
+  // tick down or up, or the rows a key asks for (an arrow one, a page key the box's 20, Home and End the tree's 40).
+  const move = (by: number, contentRows: number, isWheel: boolean) =>
+    $.ui.scroll({
+      component: 'Pane',
+      requestId: 'recap',
+      offset: Math.max(by, 0),
+      by,
+      bodyRows: 20,
+      contentRows,
+      origin: { kind: 'person' },
+      ...(isWheel && { pointer: { column: 5, row: 15 } }),
+    })
+  const wheel = (by: number, contentRows = 40) => move(by, contentRows, true)
+  const key = (by: number, contentRows = 40) => move(by, contentRows, false)
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  for (let i = 0; i < 4; i++) await check()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const shown = async (at = ui) => (await at.findAll({ type: 'Text' })).map(t => t.text)
+  const PINNED = ['GOAL', 'Read the box.']
+  const ALL = ['Recap 5.', ...PINNED, 'Recap 4.', 'Recap 3.', 'Recap 2.', 'Recap 1.']
+
+  // With the history off, the engine moves the window as it came.
+  const tick = { component: 'Pane', requestId: 'recap', offset: 1, by: 1, bodyRows: 20, contentRows: 40, origin: { kind: 'person' }, pointer: { column: 5, row: 15 } } as const
+  expect(await $.ui.scroll(tick)).toEqual({})
+  expect(moves.at(-1)).toEqual(tick)
+
+  await run('history')
+  expect(await shown()).toEqual(['Recap 4.', ...PINNED, 'Recap 3.', 'Recap 2.', 'Recap 1.'])
+  // A tick down passes the newest earlier recap, and the window stays at the top.
+  expect(await wheel(1)).toEqual({})
+  expect(moves.at(-1)).toMatchObject({ offset: 0, by: 1 })
+  expect(await shown()).toEqual(['Recap 4.', ...PINNED, 'Recap 2.', 'Recap 1.'])
+  // Never past the oldest, nor down once what is left fits the box, though up from there.
+  await wheel(10)
+  expect(await shown()).toEqual(['Recap 4.', ...PINNED, 'Recap 1.'])
+  await wheel(-1, 20)
+  await wheel(1, 20)
+  expect(await shown()).toEqual(['Recap 4.', ...PINNED, 'Recap 2.', 'Recap 1.'])
+  // A new recap keeps the person's place.
+  await check()
+  expect(await shown()).toEqual(['Recap 5.', ...PINNED, 'Recap 2.', 'Recap 1.'])
+  // Never above the newest.
+  await wheel(-10)
+  expect(await shown()).toEqual(ALL)
+
+  // An arrow or a page key moves one recap; Home and End go to the newest and the oldest.
+  await key(1)
+  await key(20)
+  expect(await shown()).toEqual(['Recap 5.', ...PINNED, 'Recap 2.', 'Recap 1.'])
+  await key(-20)
+  expect(await shown()).toEqual(['Recap 5.', ...PINNED, 'Recap 3.', 'Recap 2.', 'Recap 1.'])
+  await key(40)
+  expect(await shown()).toEqual(['Recap 5.', ...PINNED, 'Recap 1.'])
+  // Where what is left just fills the box, a page key asks for as many rows as Home would, and still moves one.
+  await key(-20, 20)
+  expect(await shown()).toEqual(['Recap 5.', ...PINNED, 'Recap 2.', 'Recap 1.'])
+  await key(-40)
+  expect(await shown()).toEqual(ALL)
+
+  // Opened or turned on again, the history starts from the newest, and so does the next conversation's. The box is
+  // shown, so /recap-box first hides it.
+  await key(1)
+  expect((await run('')).text).toBe('Recap box closed.')
+  expect((await run('')).text).toBe('Recap box opened.')
+  expect(await shown()).toEqual(ALL)
+  await key(1)
+  await run('history')
+  await run('history')
+  expect(await shown()).toEqual(ALL)
+  await key(40)
+  await $.session.end(CLEAR)
+  for (let i = 0; i < 3; i++) await check()
+  expect(await shown()).toEqual(['Recap 8.', ...PINNED, 'Recap 7.', 'Recap 6.'])
+
+  // Drawn inline on another surface too, the box shows them all there, and the terminal's dock still holds its recap
+  // and goal as it scrolls.
+  const desk = await $.ui.mount({ ...PANE, surface: 'desktop', props: { ...PANE.props, placement: 'inline' } })
+  const onDesk = async () => (await desk.findAll({ type: 'Text' })).map(t => t.text)
+  expect(await onDesk()).toEqual(['Recap 8.', ...PINNED, 'Recap 7.', 'Recap 6.'])
+  await wheel(1)
+  expect(moves.at(-1)).toMatchObject({ offset: 0 })
+  expect(await shown()).toEqual(['Recap 8.', ...PINNED, 'Recap 6.'])
+  expect(await onDesk()).toEqual(['Recap 8.', ...PINNED, 'Recap 7.', 'Recap 6.'])
+  await desk.unmount()
+
+  // Inline above the prompt in the terminal, where the box is short, it shows them all and its window scrolls as it came.
+  await ui.unmount()
+  const inline = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, placement: 'inline' } })
+  expect(await shown(inline)).toEqual(['Recap 8.', ...PINNED, 'Recap 7.', 'Recap 6.'])
+  expect(await $.ui.scroll(tick)).toEqual({})
+  expect(moves.at(-1)).toEqual(tick)
+  await inline.unmount()
+})
+
+test('with history on, a refused model call shows in the recap\'s place and stays out of the history', async ($, on) => {
+  const clock = mock.clock(on)
+  const messages: SessionMessage[] = [did(READ)]
+  const replies: Answer[] = [say('Now: First.'), { deny: 'model blocked' }, say('Now: Third.')]
+  engine(on, messages, () => replies.shift() ?? say(''), { store: new Map<string, unknown>([['history', true]]) })
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const shown = async () => (await ui.findAll({ type: 'Text' })).map(t => t.text)
+  await ends($, clock)
+  messages.push(did(EDIT))
+  await ends($, clock)
+  expect(await shown()).toEqual(['CODING', expect.stringContaining('model blocked'), 'RESEARCHING', 'First.'])
+  messages.push(did(sh('npm test')))
+  await ends($, clock)
+  expect(await shown()).toEqual(['TESTING', 'Third.', 'RESEARCHING', 'First.'])
+  await ui.unmount()
 })

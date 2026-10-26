@@ -136,9 +136,8 @@ test('the empty box waits in a theme color, on every surface', async ($, on) => 
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    const waiting = await ui.find({ type: 'Text', text: /Waiting/ })
-    expect(waiting?.text).toBe('Waiting for activity.')
-    expect(waiting?.props.color).toBe('inactive')
+    expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['Waiting for activity.'])
+    expect((await ui.find({ type: 'Text', text: /Waiting/ }))?.props.color).toBe('inactive')
     await ui.unmount()
   }
 })
@@ -615,6 +614,12 @@ test('/recap-box opens the box and checks it; with words it says what it does', 
   expect(await run('')).toBe('Recap box opened.')
   await clock.advance(2_000)
   expect((await ui.findAll({ type: 'Text' }))[0]?.text).toBe('CODING')
+  expect(prompts.length).toBe(1)
+  // Turned on, the history opens the box the same way.
+  messages.push(did(sh('npm test')))
+  await run('history')
+  await clock.advance(2_000)
+  expect((await ui.findAll({ type: 'Text' }))[0]?.text).toBe('TESTING')
   expect(prompts.length).toBe(1)
   await ui.unmount()
 

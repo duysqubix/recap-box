@@ -7,9 +7,13 @@ A Claude Code mod: a small box beside the transcript that says, in plain words, 
 - When the last five calls only read, search or run other commands, the stage is what a helper agent at work does, or researching. While the session waits on a helper agent, the stage is the helper's. When the newest test run among the last five failed, by its exit code or by a failure its output reports, the stage is debugging. A run sent to the background does not count, since its result comes later.
 - Below, pinned: the goal of the whole session, drawn from what you asked for. Haiku keeps it until your requests move on. The box sees only what you ask after it loads, so in a resumed session the goal starts from the transcript.
 - The recap and the goal use everyday words, with no jargon, no abbreviations and no names of files or code.
-- Once a minute by default, while the box is on screen, it reads the stage from the latest tool calls. When the transcript changed, it also asks Haiku for a new recap. A countdown at the bottom shows the next check.
+- Once a minute by default, while the box is on screen, it reads the stage from the latest tool calls. When the transcript changed, it also asks Haiku for a new recap.
 
-`/recap-box` opens the box again after you close it. `/recap-box update 30` makes it check every 30 seconds instead of 60, from 10 to 3600. Later sessions keep the setting; sessions already open keep theirs until they restart.
+`/recap-box` opens the box again after you close it. `/recap-box update 30` makes it check every 30 seconds instead of 60, from 10 to 3600.
+
+`/recap-box history` turns the history on or off. With it on, the box lists the session's recaps above the goal, the newest last, each earlier one dimmed under the stage it was written in. Scroll up in the box for older ones: with the mouse wheel in the fullscreen layout, or with the arrow and page keys after ctrl+x tab moves the focus to the box. Esc moves it back. The box follows each new recap while it shows the newest. It keeps the last 200, and a /clear or /resume starts the list over.
+
+Later sessions keep both settings; sessions already open keep theirs until they restart.
 
 ## Install
 

@@ -111,20 +111,17 @@ test('the box recaps new activity once, with its stage, on every surface', async
   }
 })
 
-test('the open box counts down to the next check, on every surface', async ($, on) => {
+test('an idle box says it is waiting, and counts nothing down, on every surface', async ($, on) => {
   const clock = mock.clock(on)
   engine(on, [], () => ({ deny: 'nothing to recap' }))
 
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
 
-  // Mounted first, so each count is a redraw of the open box.
-  for (const [surface, shown] of [['terminal', 'next check in 45s'], ['desktop', 'next check in 30s']] as const) {
+  for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    const waiting = await ui.find({ type: 'Text', text: /Waiting/ })
-    expect(waiting?.text).toBe('Waiting for activity.')
-    expect(waiting?.props.color).toBe('inactive')
+    expect((await ui.find({ type: 'Text', text: /Waiting/ }))?.props.color).toBe('inactive')
     await clock.advance(15_000)
-    expect((await ui.find({ type: 'Text', text: /next check/ }))?.text).toBe(shown)
+    expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['Waiting for activity.'])
     await ui.unmount()
   }
 })
@@ -177,37 +174,37 @@ test('/recap-box update sets the seconds between checks, and later sessions keep
     (await $.command.run({ command: 'recap-box', args, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })).text
 
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  const countdown = async () => (await ui.find({ type: 'Text', text: /next check/ }))?.text
 
-  // Mid-count, the count starts over at the new length.
+  // Mid-count, the count starts over at the new length, and goes on at it.
   await clock.advance(5_000)
   expect(await run('update 20')).toBe('The box checks every 20s.')
-  expect(await countdown()).toBe('next check in 20s')
   await clock.advance(19_000)
   expect(calls).toBe(0)
   await clock.advance(1_000)
   expect(calls).toBe(1)
-  expect(await countdown()).toBe('next check in 20s')
+  messages.push({ role: 'assistant', text: 'two', toolUses: [] })
+  await clock.advance(19_000)
+  expect(calls).toBe(1)
+  await clock.advance(1_000)
+  expect(calls).toBe(2)
 
   // Out of range or no number changes nothing.
-  for (const args of ['update 9', 'update 3601', 'update soon', 'update', 'faster', 'please update 30']) {
+  for (const args of ['update 9', 'update 3601', 'update soon', 'update', 'faster', 'please update 30', 'history on']) {
     expect(await run(args)).toBe(
-      '/recap-box opens the box; /recap-box update <seconds>, from 10 to 3600, sets the time between checks. The box checks every 20s.',
+      '/recap-box opens the box; /recap-box history shows or hides its earlier recaps; /recap-box update <seconds>, from 10 to 3600, sets the time between checks. The box checks every 20s.',
     )
   }
   expect(await run(' UPDATE 3600s ')).toBe('The box checks every 3600s.')
   expect(await run('update 10')).toBe('The box checks every 10s.')
   expect(store.get('every')).toBe(10)
   expect(await run('')).toBe('Recap box opened.')
-  await ui.unmount()
 
   // The box's own command asks for nothing: it is no part of the goal.
   await $.prompt.submit({ text: '/recap-box update 30', wait: false, origin: { kind: 'composer' }, command: { name: 'recap-box', args: 'update 30' } })
   await $.prompt.submit({ text: 'fix the login page', wait: false, origin: { kind: 'composer' } })
-  messages.push({ role: 'user', text: 'two', toolUses: [] })
+  messages.push({ role: 'user', text: 'three', toolUses: [] })
   await clock.advance(10_000)
-  expect(calls).toBe(2)
+  expect(calls).toBe(3)
   expect(prompts.at(-1)?.match(/^- .*$/gm)).toEqual(['- fix the login page'])
 })
 
@@ -226,25 +223,32 @@ test('a session starts at the kept length, or at 60s when the kept value is unus
   )
 
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect((await ui.find({ type: 'Text', text: /next check/ }))?.text).toBe('next check in 10s')
   await clock.advance(9_000)
   expect(calls).toBe(0)
   await clock.advance(1_000)
   expect(calls).toBe(1)
-  await ui.unmount()
 })
 
 for (const kept of [-1, 0.5, 30.5, true, 5, 3601, 1e9, 'soon']) {
   test(`a kept value of ${JSON.stringify(kept)} starts the box at 60s`, async ($, on) => {
     const clock = mock.clock(on)
-    engine(on, [], () => say('Now: Working.'), { store: new Map<string, unknown>([['every', kept]]) })
+    let calls = 0
+    engine(
+      on,
+      [{ role: 'user', text: 'one', toolUses: [] }],
+      () => {
+        calls += 1
+
+        return say('Now: Working.')
+      },
+      { store: new Map<string, unknown>([['every', kept]]) },
+    )
 
     await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    await clock.advance(59_000)
+    expect(calls).toBe(0)
     await clock.advance(1_000)
-    expect((await ui.find({ type: 'Text', text: /next check/ }))?.text).toBe('next check in 59s')
-    await ui.unmount()
+    expect(calls).toBe(1)
   })
 }
 
@@ -259,28 +263,35 @@ test('a store that cannot be read or written leaves the box at work', async ($, 
       throw new Error('the disk is full')
     },
   }
+  const messages: SessionMessage[] = [{ role: 'user', text: 'one', toolUses: [] }]
   engine(
     on,
-    [{ role: 'user', text: 'one', toolUses: [] }],
+    messages,
     () => {
       calls += 1
 
-      return say('Now: Working.')
+      return say(`Now: Working ${calls}.`)
     },
     { store: broken },
   )
+  const run = (args: string) =>
+    $.command
+      .run({ command: 'recap-box', args, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+      .then(() => 'saved', () => 'refused')
 
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await clock.advance(60_000)
   expect(calls).toBe(1)
   // A save that fails changes nothing, not even for this session.
-  const ran = $.command.run({ command: 'recap-box', args: 'update 20', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
-  expect(await ran.then(() => 'saved', () => 'refused')).toBe('refused')
+  expect(await run('update 20')).toBe('refused')
+  expect(await run('history')).toBe('refused')
+  messages.push({ role: 'assistant', text: 'two', toolUses: [] })
   await clock.advance(20_000)
-  expect((await ui.find({ type: 'Text', text: /next check/ }))?.text).toBe('next check in 40s')
+  expect(calls).toBe(1)
   await clock.advance(40_000)
-  expect((await ui.find({ type: 'Text', text: /next check/ }))?.text).toBe('next check in 60s')
+  expect(calls).toBe(2)
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['Working 2.'])
   await ui.unmount()
 })
 
@@ -296,17 +307,17 @@ test('a refused model call says so in the box', async ($, on) => {
   await ui.unmount()
 })
 
-test('a start without a surface counts down once the desktop app attaches', async ($, on) => {
+test('a start without a surface checks once the desktop app attaches', async ($, on) => {
   const clock = mock.clock(on)
-  engine(on, [], () => ({ deny: 'nothing to recap' }))
+  engine(on, [{ role: 'user', text: 'one', toolUses: [] }], () => say('Now: Working.'))
 
   // The desktop app, VS Code and mobile start this way, then attach.
   await $.session.start({ cwd: '/', surface: null, isInteractive: false })
   await $.session.attach({ surface: 'desktop', clientId: 'd1' })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  await clock.advance(15_000)
-  expect((await ui.find({ type: 'Text', text: /next check/ }))?.text).toBe('next check in 45s')
+  await clock.advance(60_000)
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['Working.'])
   await ui.unmount()
 })
 
@@ -326,10 +337,10 @@ test("a /clear drops the stage, the goal and the person's asks with the recap", 
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   const shown = async () => (await ui.findAll({ type: 'Text' })).map(t => t.text)
-  expect(await shown()).toEqual(['CODING', 'Building it.', 'GOAL', 'A recap box.', 'next check in 60s'])
+  expect(await shown()).toEqual(['CODING', 'Building it.', 'GOAL', 'A recap box.'])
   messages.length = 0
   await $.session.end(CLEAR)
-  expect(await shown()).toEqual(['Waiting for activity.', 'next check in 60s'])
+  expect(await shown()).toEqual(['Waiting for activity.'])
   await ui.unmount()
 
   // The next conversation's first check knows none of the old one's asks.
@@ -352,7 +363,7 @@ test('a /clear during a check keeps the old stage out of the new conversation', 
   await clock.advance(60_000)
   // The stage shows while the recap is still being written, with no placeholder under it.
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['CODING', 'next check in 60s'])
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['CODING'])
   messages.length = 0
   await $.session.end(CLEAR)
   await clock.advance(20_000)
@@ -384,9 +395,9 @@ test('a check that starts while a /clear ends the conversation keeps the old one
   const ending = $.session.end(CLEAR)
   await clock.advance(1_500)
   await ending
-  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['Waiting for activity.', 'next check in 59s'])
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['Waiting for activity.'])
   await clock.advance(3_000)
-  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['Waiting for activity.', 'next check in 56s'])
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['Waiting for activity.'])
   await ui.unmount()
 })
 
@@ -405,7 +416,7 @@ test('a /clear while a check reads the transcript keeps the old stage out', asyn
   await $.session.end(CLEAR)
   await clock.advance(5_000)
 
-  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['Waiting for activity.', 'next check in 55s'])
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['Waiting for activity.'])
   await ui.unmount()
 })
 
@@ -602,17 +613,10 @@ test('the goal sits pinned under what is happening now, on every surface', async
       'Adding a second summary.',
       'GOAL',
       'Make the box easy to read.',
-      'next check in 60s',
     ])
     expect((await ui.find({ type: 'Text', text: 'GOAL' }))?.props.bold).toBe(true)
     // Every color a theme key, so the box follows the person's theme.
-    expect((await ui.findAll({ type: 'Text' })).map(t => t.props.color)).toEqual([
-      'claude',
-      'text',
-      'claude',
-      'text',
-      'subtle',
-    ])
+    expect((await ui.findAll({ type: 'Text' })).map(t => t.props.color)).toEqual(['claude', 'text', 'claude', 'text'])
     await ui.unmount()
   }
 })
@@ -645,8 +649,8 @@ test('the goal holds until a reply names a new one', async ($, on) => {
 
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  // The recap, the goal's label and the goal, over the countdown.
-  const shown = async () => (await ui.findAll({ type: 'Text' })).map(t => t.text).slice(0, 3)
+  // The recap, the goal's label and the goal.
+  const shown = async () => (await ui.findAll({ type: 'Text' })).map(t => t.text)
 
   await clock.advance(60_000)
   expect(await shown()).toEqual(['Working out the plan.', 'GOAL', 'Build a recap box.'])
@@ -739,4 +743,156 @@ test("an ask is what entered beneath, from the person's own origins alone", asyn
     '- my key is [masked]',
     `- ${'x'.repeat(1199)}`,
   ])
+})
+
+test('with history on, the box lists every recap, the newest last, under the stage it was written in', async ($, on) => {
+  const clock = mock.clock(on)
+  const store = new Map<string, unknown>()
+  const messages: SessionMessage[] = [did(READ)]
+  const replies = ['Now: Reading the code.\nGoal: Add a history.', 'Now: Changing the box.', 'Now: Changing the box.', 'Now: Checking the box.']
+  engine(on, messages, () => say(replies.shift() ?? ''), { store })
+  const run = async (args: string) =>
+    (await $.command.run({ command: 'recap-box', args, origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 160 } })).text
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await clock.advance(60_000)
+  messages.push(did(EDIT))
+  await clock.advance(60_000)
+  // The same recap again adds no entry.
+  messages.push(did(EDIT))
+  await clock.advance(60_000)
+  messages.push(did(sh('npm test')))
+  await clock.advance(60_000)
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const shown = async () => (await ui.findAll({ type: 'Text' })).map(t => t.text)
+    // Off, as a first session starts: the latest recap alone.
+    expect(await shown()).toEqual(['TESTING', 'Checking the box.', 'GOAL', 'Add a history.'])
+    expect(await run('history')).toBe(
+      'The box lists its recaps, the newest last. Scroll up in it for older ones, or press ctrl+x tab, then the arrow keys.',
+    )
+    expect(store.get('history')).toBe(true)
+    expect(await shown()).toEqual([
+      'RESEARCHING',
+      'Reading the code.',
+      'CODING',
+      'Changing the box.',
+      'TESTING',
+      'Checking the box.',
+      'GOAL',
+      'Add a history.',
+    ])
+    // The earlier recaps are dimmed under their stage's color, in theme keys; the one on show stands out.
+    expect((await ui.find({ type: 'Text', text: 'CODING' }))?.props).toEqual({ color: 'claude' })
+    expect((await ui.find({ type: 'Text', text: 'Changing the box.' }))?.props).toEqual({ color: 'inactive' })
+    expect((await ui.find({ type: 'Text', text: 'TESTING' }))?.props).toMatchObject({ bold: true, color: 'autoAccept' })
+    expect(await run(' HISTORY ')).toBe('The box shows the latest recap only.')
+    expect(store.get('history')).toBe(false)
+    expect(await shown()).toEqual(['TESTING', 'Checking the box.', 'GOAL', 'Add a history.'])
+    await ui.unmount()
+  }
+})
+
+for (const [kept, isShown] of [[true, true], ['true', false], [1, false]] as const) {
+  test(`a session starts with the history ${isShown ? 'shown' : 'hidden'} when the kept value is ${JSON.stringify(kept)}, and a /clear empties it`, async ($, on) => {
+    const clock = mock.clock(on)
+    const messages: SessionMessage[] = [did(READ)]
+    const replies = ['Now: First.', 'Now: Second.', 'Now: Third.']
+    engine(on, messages, () => say(replies.shift() ?? ''), { store: new Map<string, unknown>([['history', kept]]) })
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    const shown = async () => (await ui.findAll({ type: 'Text' })).map(t => t.text)
+    await clock.advance(60_000)
+    messages.push(did(EDIT))
+    await clock.advance(60_000)
+    expect(await shown()).toEqual(isShown ? ['RESEARCHING', 'First.', 'CODING', 'Second.'] : ['CODING', 'Second.'])
+
+    // The next conversation's history starts with its own first recap.
+    messages.splice(0, messages.length, did(sh('npm test')))
+    await $.session.end(CLEAR)
+    expect(await shown()).toEqual(['Waiting for activity.'])
+    await clock.advance(60_000)
+    expect(await shown()).toEqual(['TESTING', 'Third.'])
+    await ui.unmount()
+  })
+}
+
+test('the history keeps the newest 200 recaps', async ($, on) => {
+  const clock = mock.clock(on)
+  const messages: SessionMessage[] = []
+  let n = 0
+  engine(on, messages, () => say(`Now: Recap ${++n}.`), { store: new Map<string, unknown>([['every', 10], ['history', true]]) })
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  for (let i = 0; i < 201; i++) {
+    messages.push({ role: 'assistant', text: String(i), toolUses: [] })
+    await clock.advance(10_000)
+  }
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const shown = (await ui.findAll({ type: 'Text' })).map(t => t.text)
+  expect([shown.length, shown[0], shown.at(-1)]).toEqual([200, 'Recap 2.', 'Recap 201.'])
+  await ui.unmount()
+})
+
+// The kit has no window, so whether the box follows new recaps, and stops while the person reads
+// older ones, is checked in a live session: here, only that the box never holds the wheel back.
+test("the box passes the person's wheel on untouched", async ($, on) => {
+  const moves: unknown[] = []
+  engine(on, [], () => say('Now: Working.'))
+  on('ui.scroll', (_, e) => {
+    moves.push(e)
+
+    return {}
+  })
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  // A tick up, away from the newest, and back down to it: each goes on as it came.
+  for (const offset of [19, 20]) {
+    const move = { component: 'Pane', requestId: 'recap', offset, by: offset - 20 || 1, bodyRows: 20, contentRows: 40, origin: { kind: 'person' } } as const
+    expect(await $.ui.scroll(move)).toEqual({})
+    expect(moves.at(-1)).toEqual(move)
+  }
+})
+
+test('with history on, a refused model call shows under the recaps and stays out of the history', async ($, on) => {
+  const clock = mock.clock(on)
+  const messages: SessionMessage[] = [did(READ)]
+  const replies: Answer[] = [say('Now: First.'), { deny: 'model blocked' }, say('Now: Third.')]
+  engine(on, messages, () => replies.shift() ?? say(''), { store: new Map<string, unknown>([['history', true]]) })
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const shown = async () => (await ui.findAll({ type: 'Text' })).map(t => t.text)
+  await clock.advance(60_000)
+  messages.push(did(EDIT))
+  await clock.advance(60_000)
+  expect(await shown()).toEqual(['RESEARCHING', 'First.', 'CODING', expect.stringContaining('model blocked')])
+  messages.push(did(sh('npm test')))
+  await clock.advance(60_000)
+  expect(await shown()).toEqual(['RESEARCHING', 'First.', 'TESTING', 'Third.'])
+  await ui.unmount()
+})
+
+test('the history holds 90,000 characters at most, so the newest recaps are always drawn', async ($, on) => {
+  const clock = mock.clock(on)
+  const messages: SessionMessage[] = []
+  let n = 0
+  engine(on, messages, () => say(`Now: ${String(++n).padEnd(600, '.')}`), {
+    store: new Map<string, unknown>([['every', 10], ['history', true]]),
+  })
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  for (let i = 0; i < 200; i++) {
+    messages.push({ role: 'assistant', text: String(i), toolUses: [] })
+    await clock.advance(10_000)
+  }
+
+  // 150 recaps of 600 characters fit: the first 50 are dropped.
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const shown = (await ui.findAll({ type: 'Text' })).map(t => t.text)
+  expect([shown.length, shown[0]?.slice(0, 3), shown.at(-1)?.slice(0, 4)]).toEqual([150, '51.', '200.'])
+  await ui.unmount()
 })

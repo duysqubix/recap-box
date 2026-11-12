@@ -2,7 +2,7 @@
 
 A Claude Code mod: a small box beside the transcript that says, in plain words, what the session is doing now and what it is working toward.
 
-- At the very top, centered in an outlined box: a title of two or three words for the whole chat, such as `Sign-In Fix`. Haiku names it with the first recap and keeps it until the chat moves on to something else.
+- At the very top, centered in an outlined box: a title of two or three words for the whole chat, such as `Sign-In Fix`. Haiku names it with the first recap and renames it only when it names a new goal, so the title moves only when your requests do.
 - Under it: the stage of the work and one or two sentences on what is happening now. The stage is one of researching, planning, coding, testing, debugging, reviewing, writing or shipping, each in its own theme color.
 - The stage comes from the tools the session runs, not from a guess. It is the newest of the last five calls that does more than look. Edits are coding, or writing when they change docs. Test runs are testing, review agents are reviewing, and commits, pushes and CI watches are shipping. A shell command counts by the commands it starts, so `grep -rn test` is a look and `npm test` a test run.
 - When the last five calls only read, search or run other commands, the stage is what a helper agent at work does, or researching. While the session waits on a helper agent, the stage is the helper's. When the newest test run among the last five failed, by its exit code or by a failure its output reports, the stage is debugging. A run sent to the background does not count, since its result comes later.

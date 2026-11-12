@@ -357,9 +357,13 @@ async function refresh($: EngineInterface) {
       const heading = clean(lines.match(TITLE)?.[1] ?? '').replace(BARE, '')
       const text = clean(lines.replace(GOAL, '').replace(TITLE, '').replace(NOW, ''))
       if (text) await say($, at, text)
-      if (aim && !SAME.test(aim)) await update($, goal, old => (at === epoch ? aim : old))
+      const isNewGoal = Boolean(aim) && !SAME.test(aim)
+      if (isNewGoal) await update($, goal, old => (at === epoch ? aim : old))
+      // The title follows the goal: named once, then renamed only by a reply that names a new goal, so a title
+      // reworded while the chat stays on its course never changes the box's name.
+      // ponytail: a title refused (too long) in the reply that moved the goal waits for the next new goal.
       if (heading && !SAME.test(heading) && heading.split(' ').length <= WORDS) {
-        await update($, title, old => (at === epoch ? heading : old))
+        await update($, title, old => (at === epoch && (old === null || isNewGoal) ? heading : old))
       }
     }
   } catch (err) {

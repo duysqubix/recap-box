@@ -1377,41 +1377,57 @@ test('a title of two or three words names the chat, centered in an outlined box 
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   const shown = async () => (await ui.findAll({ type: 'Text' })).map(t => t.text)
-  // Each reply, and the title and the recap the box shows after it.
-  const steps: [reply: string, heading: string, now: string][] = [
+  const AIM = 'Name the chat at the top of the box.'
+  // Each reply, and the title, the recap and the goal the box shows after it.
+  const steps: [reply: string, heading: string, now: string, aim: string][] = [
     // Each way a reply says the title still fits: "same", "same title" ahead of the recap, no title line.
-    ['Now: Checking the title.\nTitle: same', 'Chat Title Box', 'Checking the title.'],
-    ['Title: Same title.\nNow: Checking it again.', 'Chat Title Box', 'Checking it again.'],
-    ['Now: Tidying up.', 'Chat Title Box', 'Tidying up.'],
+    ['Now: Checking the title.\nTitle: same', 'Chat Title Box', 'Checking the title.', AIM],
+    ['Title: Same title.\nNow: Checking it again.', 'Chat Title Box', 'Checking it again.', AIM],
+    ['Now: Tidying up.', 'Chat Title Box', 'Tidying up.', AIM],
+    // A title reworded while the goal holds is no new name: the title follows the goal.
+    ['Now: Polishing it.\nGoal: same\nTitle: Box Heading', 'Chat Title Box', 'Polishing it.', AIM],
     // Labels run onto one line part at the sentence's end.
-    ['Now: Checking it.\nGoal: same. Title: same.', 'Chat Title Box', 'Checking it.'],
+    ['Now: Checking it.\nGoal: same. Title: same.', 'Chat Title Box', 'Checking it.', AIM],
     // A label left empty takes nothing from the labeled line under it.
-    ['Goal: same\nTitle:\nNow: Writing the box.', 'Chat Title Box', 'Writing the box.'],
-    ['Now: Renaming it.\nGoal:\nTitle: Chat Box', 'Chat Box', 'Renaming it.'],
-    // Past five words a title reads as a sentence: the one before stays.
-    ['Now: Looking it over.\nTitle: Adding a short title box to the top of the recap pane', 'Chat Box', 'Looking it over.'],
+    ['Goal: same\nTitle:\nNow: Writing the box.', 'Chat Title Box', 'Writing the box.', AIM],
+    ['Now: Renaming it.\nGoal:\nTitle: Chat Box', 'Chat Title Box', 'Renaming it.', AIM],
+    // A new goal renames the chat in the same reply.
+    ['Now: Moving on.\nGoal: Name the chat well.\nTitle: Chat Box', 'Chat Box', 'Moving on.', 'Name the chat well.'],
+    // Past five words a title reads as a sentence: the one before stays, even beside a new goal.
+    ['Now: Looking it over.\nGoal: Name it in few words.\nTitle: Adding a short title box to the top of the recap pane', 'Chat Box', 'Looking it over.', 'Name it in few words.'],
     // Any script's quotes and a heading mark come off.
-    ['Now: Translating it.\nTitle: „Anmeldung reparieren“', 'Anmeldung reparieren', 'Translating it.'],
-    ['Now: Marking it.\nTitle: # Sign-In Fix', 'Sign-In Fix', 'Marking it.'],
+    ['Now: Translating it.\nGoal: Name it in German.\nTitle: „Anmeldung reparieren“', 'Anmeldung reparieren', 'Translating it.', 'Name it in German.'],
+    ['Now: Marking it.\nGoal: Name it as a heading.\nTitle: # Sign-In Fix', 'Sign-In Fix', 'Marking it.', 'Name it as a heading.'],
     // A title that names "same" among other words is a new title.
-    ['Now: Sharing it.\nTitle: Same Box, Shared', 'Same Box, Shared', 'Sharing it.'],
+    ['Now: Sharing it.\nGoal: Share the box.\nTitle: Same Box, Shared', 'Same Box, Shared', 'Sharing it.', 'Share the box.'],
   ]
-  for (const [reply, heading, now] of steps) {
+  for (const [reply, heading, now, aim] of steps) {
     replies.push(reply)
     messages.push({ role: 'assistant', text: String(messages.length), toolUses: [] })
     await ends($, clock)
-    expect({ reply, shown: await shown() }).toEqual({ reply, shown: [heading, UPDATE, now, 'GOAL', 'Name the chat at the top of the box.'] })
+    expect({ reply, shown: await shown() }).toEqual({ reply, shown: [heading, UPDATE, now, 'GOAL', aim] })
   }
   await ui.unmount()
 
   // Each recap is shown the title it may keep.
   expect(prompts.map(p => p.split('\n')[1])).toEqual([
     'Title so far: none',
-    ...Array(6).fill('Title so far: Chat Title Box'),
+    ...Array(8).fill('Title so far: Chat Title Box'),
     ...Array(2).fill('Title so far: Chat Box'),
     'Title so far: Anmeldung reparieren',
     'Title so far: Sign-In Fix',
   ])
+})
+
+test('the first recap names the chat while its goal is still unclear', async ($, on) => {
+  const clock = mock.clock(on)
+  engine(on, [{ role: 'user', text: 'hi', toolUses: [] }], () => say('Now: Saying hello.\nGoal: none\nTitle: Getting Started'))
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ends($, clock)
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['Getting Started', 'Saying hello.'])
+  await ui.unmount()
 })
 test("the goal reads the person's own prompts, the first and the newest eight", async ($, on) => {
   const clock = mock.clock(on)

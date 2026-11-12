@@ -23,6 +23,8 @@ let isBehind = false
 const recap = atom({ plugin: 'recap-box', key: 'recap' } as const, null)
 // What the whole session works toward, pinned under the recap.
 const goal = atom({ plugin: 'recap-box', key: 'goal' } as const, null)
+// The whole chat named in two or three words, drawn in a box of its own at the very top.
+const title = atom({ plugin: 'recap-box', key: 'title' } as const, null)
 // What the person asked for, the goal's source: their first prompt and newest eight.
 // ponytail: prompts sent before the mod loaded (a resumed session) are missing; the goal then reads the tail.
 const asks = atom({ plugin: 'recap-box', key: 'asks' } as const, [])
@@ -136,9 +138,11 @@ const SYSTEM =
   'Use everyday words and short sentences: no jargon, no abbreviations, and no names of files, code, commands, ' +
   'tools or anything else coined during the work. Say what the work is for, not how it is done: ' +
   '"making sure the sign-in page works again", not "patching the auth middleware". ' +
-  'Answer in two lines. First "Now:" and one or two sentences, 30 words at most, on what is happening at the end of the transcript. ' +
+  'Answer in three lines. First "Now:" and one or two sentences, 30 words at most, on what is happening at the end of the transcript. ' +
   'Then "Goal:" and one sentence, 25 words at most, on what the whole session is working toward, ' +
   'from what the person asked for. While the goal so far still fits, write "Goal: same". ' +
+  'Then "Title:" and a name for the whole chat in two or three words, like a heading: "Sign-In Fix" for a chat about mending a sign-in page. ' +
+  'While the title so far still fits, write "Title: same". ' +
   'No preamble, no markdown.'
 
 // The prompts in the person's own words: typed, sent from a phone or the web, from an SDK host, the owner's
@@ -162,10 +166,18 @@ const transcript = (messages: readonly SessionMessage[]) =>
 // One line of plain text: a Text refuses control characters.
 const clean = (text: string) => text.replace(/[\x00-\x1f\x7f-\x9f\s]+/g, ' ').trim()
 
-// The reply's labeled lines, in either order; a goal that only says it still fits keeps the pinned one.
-const GOAL = /^\W*goal\W*:[\s*]*(.*)$/im
+// The reply's labeled lines, in any order; a goal or title that only says it still fits keeps the pinned one.
+// A label's value is on its line, or on the next where the label stands alone, never on another label's line.
+const GOAL = /^\W*goal\W*:(?:[ \t*]|\n(?!\W*(?:now|goal|title)\W*:))*(.*)$/im
+const TITLE = /^\W*title\W*:(?:[ \t*]|\n(?!\W*(?:now|goal|title)\W*:))*(.*)$/im
 const NOW = /^\W*now\W*:[\s*]*/im
-const SAME = /^\W*(still )?(the )?(same|unchanged|no changes?|none)( one| goal)?( as before| so far| yet| from before)?\W*$/i
+// A label run on after a sentence's end gets a line of its own: "Goal: same. Title: same."
+const SPLIT = /([.;|])[ \t]+(?=\W*\b(?:now|goal|title)\W*:)/gi
+const SAME = /^\W*(still )?(the )?(same|unchanged|no changes?|none)( one| goal| title)?( as before| so far| yet| from before)?\W*$/i
+// A heading wears no quotes (in any script's marks), emphasis, heading mark or full stop.
+const BARE = /^[\s"'“‘„«「『*_#`]+|[\s"'”’“»」』*_.`]+$/g
+// Past this many words a title reads as a sentence, and the one before stays.
+const WORDS = 5
 
 // A cut can split an emoji's pair, and the API refuses a lone half: keep whole pairs, drop halves.
 const whole = (text: string) => text.replace(/([\ud800-\udbff][\udc00-\udfff])|[\ud800-\udfff]/g, '$1')
@@ -310,6 +322,7 @@ async function refresh($: EngineInterface) {
     // Read before the clock, so the gap runs from the call itself.
     const prompt = whole(
       `Goal so far: ${(await read($, goal)) ?? 'none'}\n` +
+        `Title so far: ${(await read($, title)) ?? 'none'}\n` +
         `Previous recap: ${(await read($, recap)) ?? 'none'}\n\n` +
         `What the person asked for, oldest first:\n${(await read($, asks)).map(t => `- ${t}`).join('\n') || 'none'}\n\n` +
         `Transcript tail, oldest first:\n${tail}`,
@@ -338,11 +351,16 @@ async function refresh($: EngineInterface) {
       timeoutMs: 30_000,
     })
     if (reply.isAnswered) {
-      // Every line but the goal's is the recap.
-      const aim = clean(reply.text.match(GOAL)?.[1] ?? '')
-      const text = clean(reply.text.replace(GOAL, '').replace(NOW, ''))
+      // Every line but the goal's and the title's is the recap.
+      const lines = reply.text.replace(SPLIT, '$1\n')
+      const aim = clean(lines.match(GOAL)?.[1] ?? '')
+      const heading = clean(lines.match(TITLE)?.[1] ?? '').replace(BARE, '')
+      const text = clean(lines.replace(GOAL, '').replace(TITLE, '').replace(NOW, ''))
       if (text) await say($, at, text)
       if (aim && !SAME.test(aim)) await update($, goal, old => (at === epoch ? aim : old))
+      if (heading && !SAME.test(heading) && heading.split(' ').length <= WORDS) {
+        await update($, title, old => (at === epoch ? heading : old))
+      }
     }
   } catch (err) {
     // Only a request the engine refuses to send rejects (a blocked model): say so in the box, not in its history.
@@ -515,6 +533,7 @@ export const register: Register = on => {
     await update($, asks, () => [])
     await update($, recap, () => null)
     await update($, goal, () => null)
+    await update($, title, () => null)
     await update($, stage, () => null)
     await update($, history, () => [])
     // Read before the end: after it, a check may still read this tail for a while.
@@ -525,6 +544,7 @@ export const register: Register = on => {
     epoch += 1
     await update($, recap, () => null)
     await update($, goal, () => null)
+    await update($, title, () => null)
     await update($, stage, () => null)
     await update($, history, () => [])
     // A /resume brings a transcript of its own: recap it. A /clear brings none, and an exit or logout ends here.
@@ -556,6 +576,7 @@ export const register: Register = on => {
     if (e.surface === 'terminal') isInline = isHere
     const text = await read($, recap)
     const aim = await read($, goal)
+    const heading = await read($, title)
     const name = await read($, stage)
     // Drawn at last (the person opened it, or widened the terminal): a recap that came due while it
     // waited undrawn is checked now. Only with nothing pending, so the check's own writes, which
@@ -569,6 +590,15 @@ export const register: Register = on => {
     // Every color a theme key, so the box follows the person's theme: the goal's label in Claude's own.
     return (
       <Box flexDirection="column" gap={1}>
+        {/* The chat's name, centered in a rounded outline like Claude Code's own welcome box: one line, cut at the
+            edge rather than wrapped, so the box keeps its height. */}
+        {heading && (
+          <Box flexDirection="row" borderStyle="round" borderColor="claude" justifyContent="center">
+            <Text bold color="text" wrap="truncate">
+              {heading}
+            </Text>
+          </Box>
+        )}
         {isBehind && <Text color="suggestion">Update available: /recap-box upgrade</Text>}
         <Box flexDirection="column">
           {name && <Text bold color={STAGES[name]}>{name.toUpperCase()}</Text>}

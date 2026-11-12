@@ -920,14 +920,14 @@ test('a start without a surface recaps once the desktop app attaches', async ($,
   await ui.unmount()
 })
 
-test("a /clear drops the stage, the goal and the person's asks with the recap", async ($, on) => {
+test("a /clear drops the stage, the goal, the title and the person's asks with the recap", async ($, on) => {
   const clock = mock.clock(on)
   const messages: SessionMessage[] = [did(EDIT)]
   const prompts: string[] = []
   engine(on, messages, e => {
     prompts.push(e.prompt)
 
-    return say('Building it.\nGoal: A recap box.')
+    return say('Building it.\nGoal: A recap box.\nTitle: Recap Box')
   })
 
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
@@ -936,7 +936,7 @@ test("a /clear drops the stage, the goal and the person's asks with the recap", 
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   const shown = async () => (await ui.findAll({ type: 'Text' })).map(t => t.text)
-  expect(await shown()).toEqual(['CODING', 'Building it.', 'GOAL', 'A recap box.'])
+  expect(await shown()).toEqual(['Recap Box', 'CODING', 'Building it.', 'GOAL', 'A recap box.'])
   messages.length = 0
   await $.session.end(CLEAR)
   expect(await shown()).toEqual(['Waiting for activity.'])
@@ -947,6 +947,7 @@ test("a /clear drops the stage, the goal and the person's asks with the recap", 
   await ends($, clock)
   expect(prompts.at(-2)).toContain('oldest first:\n- build a recap box\n')
   expect(prompts.at(-1)).toContain('oldest first:\nnone\n')
+  expect(prompts.at(-1)).toContain('Title so far: none\n')
 })
 
 test('a /clear during a check keeps the old stage out of the new conversation', async ($, on) => {
@@ -955,7 +956,7 @@ test('a /clear during a check keeps the old stage out of the new conversation', 
   engine(on, messages, async () => {
     await clock.sleep(20_000)
 
-    return say('Old talk.\nGoal: Old aim.')
+    return say('Old talk.\nGoal: Old aim.\nTitle: Old Talk')
   })
 
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
@@ -967,7 +968,7 @@ test('a /clear during a check keeps the old stage out of the new conversation', 
   await $.session.end(CLEAR)
   await clock.advance(20_000)
 
-  expect(await ui.find({ type: 'Text', text: /CODING|GOAL|Old aim/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /CODING|GOAL|Old aim|Old Talk/ })).toBeUndefined()
   expect((await ui.find({ type: 'Text', text: /Waiting/ }))?.text).toBe('Waiting for activity.')
   await ui.unmount()
   // Every read and reply still asleep runs out before the test ends.
@@ -986,7 +987,7 @@ test('a check that starts while a /clear ends the conversation keeps the old one
   const model = async () => {
     await clock.sleep(3_000)
 
-    return say('Now: Pushing the old work.\nGoal: The old aim.')
+    return say('Now: Pushing the old work.\nGoal: The old aim.\nTitle: Old Work')
   }
   engine(on, messages, model, { end })
 
@@ -1000,6 +1001,38 @@ test('a check that starts while a /clear ends the conversation keeps the old one
   await ending
   expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['Waiting for activity.'])
   await clock.advance(3_000)
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['Waiting for activity.'])
+  await ui.unmount()
+  // Every read and reply still asleep runs out before the test ends.
+  await clock.advance(60_000)
+})
+
+test('a recap that lands while a /clear ends the conversation keeps its title, goal and recap out of the next one', async ($, on) => {
+  const clock = mock.clock(on)
+  const messages: SessionMessage[] = [did(EDIT)]
+  // The engine's end takes three seconds; the old conversation's recap lands half a second after its check starts.
+  const end = async () => {
+    await clock.sleep(3_000)
+    messages.length = 0
+  }
+  engine(
+    on,
+    messages,
+    async () => {
+      await clock.sleep(500)
+
+      return say('Now: Old work.\nGoal: Old aim.\nTitle: Old Work')
+    },
+    { end },
+  )
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const ending = $.session.end(CLEAR)
+  await clock.settle()
+  await $.turn.complete(END)
+  await clock.advance(3_000)
+  await ending
   expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['Waiting for activity.'])
   await ui.unmount()
   // Every read and reply still asleep runs out before the test ends.
@@ -1295,6 +1328,91 @@ test('the goal holds until a reply names a new one', async ($, on) => {
   expect(prompts.map(p => p.split('\n')[0])).toEqual(['Goal so far: none', ...Array(11).fill('Goal so far: Build a recap box.')])
 })
 
+test('a title of two or three words names the chat, centered in an outlined box at the very top, until a reply names a new one', async ($, on) => {
+  const clock = mock.clock(on)
+  const messages: SessionMessage[] = [{ role: 'user', text: 'add a title to the box', toolUses: [] }]
+  const prompts: string[] = []
+  const systems: string[] = []
+  // Quotes, emphasis and a full stop come off a heading.
+  const replies = ['Now: Adding a title.\nGoal: Name the chat at the top of the box.\n**Title:** "Chat Title Box."']
+  engine(
+    on,
+    messages,
+    e => {
+      prompts.push(e.prompt)
+      systems.push(String(e.system))
+
+      return say(replies.shift() ?? '')
+    },
+    { github: () => compared(1) },
+  )
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await ends($, clock)
+  // Haiku is asked for the title on a line of its own, and to say when it still fits.
+  expect(systems[0]).toContain('"Title:"')
+  expect(systems[0]).toContain('"Title: same"')
+
+  for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    // First of all, above the update notice too, and kept out of the recap.
+    expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual([
+      'Chat Title Box',
+      UPDATE,
+      'Adding a title.',
+      'GOAL',
+      'Name the chat at the top of the box.',
+    ])
+    const outlined = (await ui.findAll({ type: 'Box' })).filter(b => b.props.borderStyle)
+    expect(outlined.length).toBe(1)
+    // Laid out in a row, so the centering runs across on every surface.
+    expect(outlined[0]).toMatchObject({
+      text: 'Chat Title Box',
+      props: { flexDirection: 'row', borderStyle: 'round', borderColor: 'claude', justifyContent: 'center' },
+    })
+    // One line, cut at the edge, so the box keeps its height.
+    expect((await ui.find({ type: 'Text', text: 'Chat Title Box' }))?.props).toMatchObject({ bold: true, color: 'text', wrap: 'truncate' })
+    await ui.unmount()
+  }
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const shown = async () => (await ui.findAll({ type: 'Text' })).map(t => t.text)
+  // Each reply, and the title and the recap the box shows after it.
+  const steps: [reply: string, heading: string, now: string][] = [
+    // Each way a reply says the title still fits: "same", "same title" ahead of the recap, no title line.
+    ['Now: Checking the title.\nTitle: same', 'Chat Title Box', 'Checking the title.'],
+    ['Title: Same title.\nNow: Checking it again.', 'Chat Title Box', 'Checking it again.'],
+    ['Now: Tidying up.', 'Chat Title Box', 'Tidying up.'],
+    // Labels run onto one line part at the sentence's end.
+    ['Now: Checking it.\nGoal: same. Title: same.', 'Chat Title Box', 'Checking it.'],
+    // A label left empty takes nothing from the labeled line under it.
+    ['Goal: same\nTitle:\nNow: Writing the box.', 'Chat Title Box', 'Writing the box.'],
+    ['Now: Renaming it.\nGoal:\nTitle: Chat Box', 'Chat Box', 'Renaming it.'],
+    // Past five words a title reads as a sentence: the one before stays.
+    ['Now: Looking it over.\nTitle: Adding a short title box to the top of the recap pane', 'Chat Box', 'Looking it over.'],
+    // Any script's quotes and a heading mark come off.
+    ['Now: Translating it.\nTitle: „Anmeldung reparieren“', 'Anmeldung reparieren', 'Translating it.'],
+    ['Now: Marking it.\nTitle: # Sign-In Fix', 'Sign-In Fix', 'Marking it.'],
+    // A title that names "same" among other words is a new title.
+    ['Now: Sharing it.\nTitle: Same Box, Shared', 'Same Box, Shared', 'Sharing it.'],
+  ]
+  for (const [reply, heading, now] of steps) {
+    replies.push(reply)
+    messages.push({ role: 'assistant', text: String(messages.length), toolUses: [] })
+    await ends($, clock)
+    expect({ reply, shown: await shown() }).toEqual({ reply, shown: [heading, UPDATE, now, 'GOAL', 'Name the chat at the top of the box.'] })
+  }
+  await ui.unmount()
+
+  // Each recap is shown the title it may keep.
+  expect(prompts.map(p => p.split('\n')[1])).toEqual([
+    'Title so far: none',
+    ...Array(6).fill('Title so far: Chat Title Box'),
+    ...Array(2).fill('Title so far: Chat Box'),
+    'Title so far: Anmeldung reparieren',
+    'Title so far: Sign-In Fix',
+  ])
+})
 test("the goal reads the person's own prompts, the first and the newest eight", async ($, on) => {
   const clock = mock.clock(on)
   const prompts: string[] = []

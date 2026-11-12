@@ -7,6 +7,7 @@ declare module 'claude-code' {
     'recap-box': {
       recap: Recap | null
       goal: string | null
+      title: string | null
       asks: readonly string[]
       stage: Stage | null
       history: readonly Entry[]
